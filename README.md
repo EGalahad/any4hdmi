@@ -9,37 +9,15 @@
 
 The motion plus the dataset timestep from `manifest.json` is enough to replay the clip in MuJoCo.
 
-## MJCF Assets
+## Datasets
 
-This repo does not vendor `g1.xml` or STL meshes under `assets/`.
-
-Instead, manifests and converters use the Hugging Face repo `elijahgalahad/g1_xmls` and resolve the MJCF from the standard Hugging Face cache at runtime. The default reference is:
-
-- repo: `elijahgalahad/g1_xmls`
-- path: `g1.xml`
-- revision: `main`
-
-The current XML/STL bundle can be refreshed from:
-
-- `https://github.com/EGalahad/lafan-process`
-- `https://huggingface.co/elijahgalahad/g1_xmls/tree/main`
-
-## Layout
-
-```text
-any4hdmi/
-  docs/
-  output/
-    <dataset>/
-      manifest.json
-      motions/
-  src/any4hdmi/
-```
-
-## Environment
+Clone the source datasets from Hugging Face:
 
 ```bash
-uv sync
+git clone https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset data/LAFAN1_Retargeting_Dataset
+git clone https://huggingface.co/datasets/bones-studio/seed data/seed
+
+tar xzf data/seed/g1.tar -C data/seed/g1
 ```
 
 ## Commands
@@ -48,7 +26,7 @@ Convert LAFAN:
 
 ```bash
 uv run any4hdmi-convert-lafan \
-  --csv-dir ../lafan-process/LAFAN1_Retargeting_Dataset/g1 \
+  --csv-dir data/LAFAN1_Retargeting_Dataset/g1 \
   --out-dir output/lafan
 ```
 
@@ -56,7 +34,7 @@ Convert SONIC:
 
 ```bash
 uv run any4hdmi-convert-sonic \
-  --csv-dir ../g1_sonic/complete/g1/csv \
+  --csv-dir data/seed/g1/csv \
   --out-dir output/sonic
 ```
 
@@ -64,7 +42,7 @@ Override the MJCF reference if needed:
 
 ```bash
 uv run any4hdmi-convert-sonic \
-  --csv-dir ../g1_sonic/complete/g1/csv \
+  --csv-dir data/seed/g1/csv \
   --out-dir output/sonic \
   --mjcf-repo elijahgalahad/g1_xmls \
   --mjcf-path g1.xml \
@@ -85,5 +63,5 @@ uv run any4hdmi-view \
   --headless
 ```
 
-Pipeline details live in [docs/pipeline.md](/home/elijah/Documents/projects/simple-tracking/any4hdmi/docs/pipeline.md).
-Dataset format details live in [docs/dataset_format.md](/home/elijah/Documents/projects/simple-tracking/any4hdmi/docs/dataset_format.md).
+Pipeline details live in [docs/pipeline.md](docs/pipeline.md).
+Dataset format details live in [docs/dataset_format.md](docs/dataset_format.md).
