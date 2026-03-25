@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "any4hdmi"
+version = "0.1.0"
+description = "Unified qpos-based motion conversion and MuJoCo playback for HDMI-related datasets."
+requires-python = ">=3.10"
+dependencies = [
+    "huggingface_hub>=0.30",
+    "mujoco>=2.3.7",
+    "mujoco-warp",
+    "numpy>=1.23",
+    "tqdm>=4.66",
+]
+
+[project.scripts]
+any4hdmi-view = "any4hdmi.viewer:main"
+any4hdmi-convert-lafan = "any4hdmi.datasets.lafan:main"
+any4hdmi-convert-sonic = "any4hdmi.datasets.sonic:main"
+any4hdmi-filter-dataset = "any4hdmi.filter_dataset:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
