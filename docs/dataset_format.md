@@ -61,12 +61,7 @@ Example:
 {
   "format_version": 2,
   "dataset_name": "sonic",
-  "mjcf": {
-    "kind": "huggingface",
-    "repo_id": "elijahgalahad/g1_xmls",
-    "path": "g1.xml",
-    "revision": "main"
-  },
+  "mjcf": "hf://elijahgalahad/g1_xmls@main/g1.xml",
   "motions_subdir": "motions",
   "timestep": 0.008333333333333333,
   "qpos_dim": 36,
@@ -90,7 +85,8 @@ Example:
 }
 ```
 
-`mjcf.kind == "huggingface"` means the runtime should resolve the XML and meshes from the Hugging Face cache using `snapshot_download`.
+An `mjcf` value starting with `hf://` means the runtime should resolve the XML and
+meshes from the Hugging Face cache through `mjhub.resolve_mjcf_reference(...)`.
 
 ## Motion Files
 

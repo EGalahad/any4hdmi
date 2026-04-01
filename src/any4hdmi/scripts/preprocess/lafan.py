@@ -4,21 +4,17 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+from mjhub import resolve_mjcf_reference
 from tqdm import tqdm
 
-from any4hdmi.datasets.common import G1_JOINT_ORDER, base_qpos_adr, joint_qpos_adrs, load_model
-from any4hdmi.format import (
+from any4hdmi.core.format import MOTION_DTYPE, MOTIONS_SUBDIR, repo_root, save_motion, write_manifest
+from any4hdmi.core.model import G1_JOINT_ORDER, base_qpos_adr, joint_qpos_adrs, load_model
+from any4hdmi.utils.mjcf import (
     DEFAULT_MJCF_PATH,
     DEFAULT_MJCF_REPO_ID,
     DEFAULT_MJCF_REVISION,
-    MOTION_DTYPE,
-    MOTIONS_SUBDIR,
     build_hf_mjcf_reference,
     qpos_names_from_model,
-    repo_root,
-    resolve_mjcf_reference,
-    save_motion,
-    write_manifest,
 )
 
 
@@ -55,11 +51,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--start", type=int, default=0, help="Start frame index.")
     parser.add_argument("--end", type=int, default=-1, help="End frame index.")
     parser.add_argument("--stride", type=int, default=1, help="Frame stride.")
-    parser.add_argument(
-        "--pattern",
-        default="*.csv",
-        help="Glob pattern relative to --csv-dir.",
-    )
+    parser.add_argument("--pattern", default="*.csv", help="Glob pattern relative to --csv-dir.")
     return parser.parse_args()
 
 

@@ -3,33 +3,23 @@ from __future__ import annotations
 import argparse
 import csv
 import multiprocessing
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import os
 from pathlib import Path
 
 import numpy as np
+from mjhub import resolve_mjcf_reference
 from tqdm import tqdm
 
-from any4hdmi.datasets.common import (
-    G1_JOINT_ORDER,
-    base_qpos_adr,
-    euler_to_quat_wxyz,
-    joint_qpos_adrs,
-    load_model,
-    maybe_degrees_to_radians,
-)
-from any4hdmi.format import (
+from any4hdmi.core.format import MOTION_DTYPE, MOTIONS_SUBDIR, repo_root, save_motion, write_manifest
+from any4hdmi.core.model import G1_JOINT_ORDER, base_qpos_adr, joint_qpos_adrs, load_model
+from any4hdmi.utils.math import euler_to_quat_wxyz, maybe_degrees_to_radians
+from any4hdmi.utils.mjcf import (
     DEFAULT_MJCF_PATH,
     DEFAULT_MJCF_REPO_ID,
     DEFAULT_MJCF_REVISION,
-    MOTION_DTYPE,
-    MOTIONS_SUBDIR,
     build_hf_mjcf_reference,
     qpos_names_from_model,
-    repo_root,
-    resolve_mjcf_reference,
-    save_motion,
-    write_manifest,
 )
 
 
@@ -42,11 +32,7 @@ def _parse_args() -> argparse.Namespace:
         default=str(repo_root().parent / "g1_sonic" / "complete" / "g1" / "csv"),
         help="Directory containing source CSV files.",
     )
-    parser.add_argument(
-        "--out-dir",
-        default="output/sonic",
-        help="Output dataset root for converted motions.",
-    )
+    parser.add_argument("--out-dir", default="output/sonic", help="Output dataset root for converted motions.")
     parser.add_argument(
         "--mjcf-repo",
         default=DEFAULT_MJCF_REPO_ID,
@@ -75,11 +61,7 @@ def _parse_args() -> argparse.Namespace:
         default="deg",
         help="Unit used by root Euler angles and joint dof columns.",
     )
-    parser.add_argument(
-        "--euler-order",
-        default="xyz",
-        help="Euler axis order for root rotations.",
-    )
+    parser.add_argument("--euler-order", default="xyz", help="Euler axis order for root rotations.")
     parser.add_argument(
         "--euler-frame",
         choices=["intrinsic", "extrinsic"],
@@ -89,11 +71,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--start", type=int, default=0, help="Start frame index.")
     parser.add_argument("--end", type=int, default=-1, help="End frame index.")
     parser.add_argument("--stride", type=int, default=1, help="Frame stride.")
-    parser.add_argument(
-        "--pattern",
-        default="*.csv",
-        help="Glob pattern relative to --csv-dir.",
-    )
+    parser.add_argument("--pattern", default="*.csv", help="Glob pattern relative to --csv-dir.")
     parser.add_argument(
         "--workers",
         type=int,
@@ -151,7 +129,6 @@ def _build_qpos_sequence(
         raise ValueError(f"Missing required columns: {missing}")
 
     qpos = np.zeros((motion.shape[0], qpos_dim), dtype=MOTION_DTYPE)
-
     translation_cols = [
         column_index["root_translateX"],
         column_index["root_translateY"],
@@ -165,7 +142,8 @@ def _build_qpos_sequence(
     joint_cols = [column_index[f"{joint_name}_dof"] for joint_name in G1_JOINT_ORDER]
 
     root_translation = np.asarray(
-        motion[:, translation_cols] * MOTION_DTYPE(translation_scale), dtype=MOTION_DTYPE
+        motion[:, translation_cols] * MOTION_DTYPE(translation_scale),
+        dtype=MOTION_DTYPE,
     )
     root_euler = maybe_degrees_to_radians(motion[:, rotation_cols], angle_unit)
     root_quat = euler_to_quat_wxyz(root_euler, euler_order, euler_frame)
@@ -189,7 +167,6 @@ def _convert_one(
     angle_unit: str,
     euler_order: str,
     euler_frame: str,
-    fps: float,
     start: int,
     end: int,
     stride: int,
@@ -208,16 +185,32 @@ def _convert_one(
         euler_order=euler_order,
         euler_frame=euler_frame,
     )
-
     rel_path = csv_path.relative_to(csv_dir).with_suffix(".npz")
     save_motion(out_dir / MOTIONS_SUBDIR / rel_path, qpos)
+
+
+def _available_cpu_ids() -> tuple[int, ...] | None:
+    if not hasattr(os, "sched_getaffinity"):
+        return None
+    return tuple(sorted(os.sched_getaffinity(0)))
+
+
+def _init_process_affinity(cpu_ids: tuple[int, ...] | None) -> None:
+    if cpu_ids is None:
+        return
+    if not hasattr(os, "sched_setaffinity"):
+        raise RuntimeError("CPU pinning requires os.sched_setaffinity, which is not available here")
+    identity = multiprocessing.current_process()._identity
+    worker_index = identity[0] - 1 if identity else 0
+    cpu_id = cpu_ids[worker_index % len(cpu_ids)]
+    os.sched_setaffinity(0, {cpu_id})
 
 
 def _run_parallel(
     csv_files: list[Path],
     *,
     workers: int,
-    task_kwargs: dict,
+    task_kwargs: dict[str, object],
     cpu_ids: tuple[int, ...] | None,
 ) -> None:
     max_in_flight = max(workers * 4, 1)
@@ -240,24 +233,6 @@ def _run_parallel(
                 for future in done:
                     future.result()
                     progress.update(1)
-
-
-def _available_cpu_ids() -> tuple[int, ...] | None:
-    if not hasattr(os, "sched_getaffinity"):
-        return None
-    return tuple(sorted(os.sched_getaffinity(0)))
-
-
-def _init_process_affinity(cpu_ids: tuple[int, ...] | None) -> None:
-    if cpu_ids is None:
-        return
-    if not hasattr(os, "sched_setaffinity"):
-        raise RuntimeError("CPU pinning requires os.sched_setaffinity, which is not available here")
-
-    identity = multiprocessing.current_process()._identity
-    worker_index = identity[0] - 1 if identity else 0
-    cpu_id = cpu_ids[worker_index % len(cpu_ids)]
-    os.sched_setaffinity(0, {cpu_id})
 
 
 def main() -> None:
@@ -307,7 +282,6 @@ def main() -> None:
         "angle_unit": args.angle_unit,
         "euler_order": args.euler_order,
         "euler_frame": args.euler_frame,
-        "fps": args.fps,
         "start": args.start,
         "end": args.end,
         "stride": args.stride,
@@ -317,12 +291,7 @@ def main() -> None:
         for csv_path in tqdm(csv_files, desc="Converting SONIC", unit="file"):
             _convert_one(csv_path, **task_kwargs)
     else:
-        _run_parallel(
-            csv_files,
-            workers=worker_count,
-            task_kwargs=task_kwargs,
-            cpu_ids=cpu_ids,
-        )
+        _run_parallel(csv_files, workers=worker_count, task_kwargs=task_kwargs, cpu_ids=cpu_ids)
 
     write_manifest(
         out_dir,

@@ -1,6 +1,7 @@
 output/
 .vscode
 stubs
+.codex
 
 
 # Byte-compiled / optimized / DLL files
