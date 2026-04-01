@@ -40,7 +40,9 @@ G1_JOINT_ORDER = [
 
 
 def load_model(mjcf_path: str | Path) -> mujoco.MjModel:
-    mjcf_path = Path(mjcf_path).expanduser().resolve()
+    # Keep Hugging Face snapshot symlinks intact so MuJoCo resolves relative
+    # mesh/asset paths against the snapshot directory instead of the blob store.
+    mjcf_path = Path(mjcf_path).expanduser().absolute()
     if not mjcf_path.is_file():
         raise FileNotFoundError(f"MJCF not found: {mjcf_path}")
     return mujoco.MjModel.from_xml_path(str(mjcf_path))

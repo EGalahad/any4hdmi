@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 from collections import Counter
 from dataclasses import dataclass
@@ -12,11 +11,15 @@ from typing import Any
 import torch
 from mjhub import resolve_mjcf_reference
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from any4hdmi.core.format import ensure_dir, load_manifest, load_motion, write_manifest
+from any4hdmi.core.format import ensure_dir, load_manifest, write_manifest
 from any4hdmi.fk.runner import FKRunner, compute_root_qvel_many_torch
+from any4hdmi.utils.dataset import (
+    DEFAULT_MOTION_LOADER_NUM_WORKERS,
+    DEFAULT_MOTION_LOADER_PREFETCH_FACTOR,
+    build_motion_loader,
+)
 
 
 REPORT_NAME = "filter_report.json"
@@ -26,8 +29,8 @@ DEFAULT_ALL_OFF_GROUND_Z = 0.2
 DEFAULT_MAX_ALL_OFF_GROUND_SECONDS = 1.0
 DEFAULT_MIN_MAX_BODY_Z = 0.2
 DEFAULT_BATCH_SIZE = 2048
-DEFAULT_NUM_WORKERS = min(4, max(0, (os.cpu_count() or 1) - 1))
-DEFAULT_PREFETCH_FACTOR = 2
+DEFAULT_NUM_WORKERS = DEFAULT_MOTION_LOADER_NUM_WORKERS
+DEFAULT_PREFETCH_FACTOR = DEFAULT_MOTION_LOADER_PREFETCH_FACTOR
 
 
 @dataclass(frozen=True)
@@ -46,25 +49,6 @@ class MotionCheckResult:
     reasons: tuple[str, ...]
     num_frames: int
     fps: float
-
-
-class MotionTensorDataset(Dataset[dict[str, Any]]):
-    def __init__(self, *, input_root: Path, motion_paths: list[Path], fps: float) -> None:
-        self.input_root = input_root
-        self.motion_paths = motion_paths
-        self.fps = float(fps)
-
-    def __len__(self) -> int:
-        return len(self.motion_paths)
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        motion_path = self.motion_paths[index]
-        return {
-            "motion_path": motion_path,
-            "rel_motion": motion_path.relative_to(self.input_root),
-            "qpos": torch.from_numpy(load_motion(motion_path)).contiguous(),
-            "fps": self.fps,
-        }
 
 
 def _parse_args() -> argparse.Namespace:
@@ -203,33 +187,6 @@ def _motion_name_is_kept(rel_motion: Path, keep_names: frozenset[str] | None) ->
     if keep_names is None:
         return True
     return rel_motion.stem in keep_names
-
-
-def _unwrap_single_motion_item(items: list[dict[str, Any]]) -> dict[str, Any]:
-    return items[0]
-
-
-def _build_motion_loader(
-    *,
-    input_root: Path,
-    motion_paths: list[Path],
-    fps: float,
-    num_workers: int,
-    prefetch_factor: int,
-    pin_memory: bool,
-) -> DataLoader[dict[str, Any]]:
-    loader_kwargs: dict[str, Any] = {
-        "dataset": MotionTensorDataset(input_root=input_root, motion_paths=motion_paths, fps=fps),
-        "batch_size": 1,
-        "shuffle": False,
-        "num_workers": max(0, int(num_workers)),
-        "collate_fn": _unwrap_single_motion_item,
-        "pin_memory": pin_memory,
-        "persistent_workers": num_workers > 0,
-    }
-    if num_workers > 0:
-        loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
-    return DataLoader(**loader_kwargs)
 
 
 def _batched_contiguous_true_run_length_torch(mask: torch.Tensor) -> torch.Tensor:
@@ -449,7 +406,7 @@ def main() -> None:
         reason_counts.update(["not_in_keep_filenames"])
         skipped_count += 1
 
-    motion_loader = _build_motion_loader(
+    motion_loader = build_motion_loader(
         input_root=input_root,
         motion_paths=selected_motion_paths,
         fps=fps,

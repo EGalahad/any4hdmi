@@ -169,6 +169,55 @@ class FKRunner:
             "joint_vel": joint_vel,
         }
 
+    def _forward_kinematics_warp(
+        self,
+        qpos: torch.Tensor,
+        qvel: torch.Tensor,
+        *,
+        joint_qpos_addrs: torch.Tensor,
+        joint_dof_addrs: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        assert self._mjw is not None
+        assert self._wp is not None
+        assert self._warp_model is not None
+        assert self._warp_data is not None
+
+        qpos = self.to_device(qpos)
+        qvel = qvel.to(device=self.device, dtype=torch.float32, non_blocking=True).contiguous()
+        joint_qpos_addrs = joint_qpos_addrs.to(device=self.device, dtype=torch.long)
+        joint_dof_addrs = joint_dof_addrs.to(device=self.device, dtype=torch.long)
+
+        nworld = int(qpos.shape[0])
+        if nworld > self.batch_size:
+            raise ValueError(f"Chunk size {nworld} exceeds batch_size {self.batch_size}")
+
+        qpos_work = qpos
+        qvel_work = qvel
+        if nworld < self.batch_size:
+            padded_qpos = torch.zeros((self.batch_size, self.model.nq), dtype=qpos.dtype, device=self.device)
+            padded_qvel = torch.zeros((self.batch_size, self.model.nv), dtype=qvel.dtype, device=self.device)
+            padded_qpos[:nworld] = qpos
+            padded_qvel[:nworld] = qvel
+            qpos_work = padded_qpos
+            qvel_work = padded_qvel
+
+        self._wp.copy(self._warp_data.qpos, self._wp.from_torch(qpos_work))
+        self._wp.copy(self._warp_data.qvel, self._wp.from_torch(qvel_work))
+        self._mjw.fwd_position(self._warp_model, self._warp_data)
+        self._mjw.fwd_velocity(self._warp_model, self._warp_data)
+        if hasattr(self._wp, "synchronize"):
+            self._wp.synchronize()
+
+        cvel = self._wp.to_torch(self._warp_data.cvel)[:nworld].clone()
+        return {
+            "body_pos_w": self._wp.to_torch(self._warp_data.xpos)[:nworld].clone(),
+            "body_lin_vel_w": cvel[..., 3:6].clone(),
+            "body_quat_w": self._wp.to_torch(self._warp_data.xquat)[:nworld].clone(),
+            "body_ang_vel_w": cvel[..., 0:3].clone(),
+            "joint_pos": qpos_work[:nworld].index_select(1, joint_qpos_addrs).clone(),
+            "joint_vel": qvel_work[:nworld].index_select(1, joint_dof_addrs).clone(),
+        }
+
     def _forward_positions_warp(self, qpos: torch.Tensor) -> torch.Tensor:
         assert self._mjw is not None
         assert self._wp is not None
@@ -237,12 +286,48 @@ class FKRunner:
     ) -> list[dict[str, torch.Tensor]]:
         if len(qpos_list) != len(qvel_list):
             raise ValueError("qpos_list and qvel_list must have the same length")
-        return [
-            self._forward_kinematics_cpu(
-                qpos,
-                qvel,
-                joint_qpos_addrs=joint_qpos_addrs,
-                joint_dof_addrs=joint_dof_addrs,
-            )
-            for qpos, qvel in zip(qpos_list, qvel_list, strict=True)
+        if not qpos_list:
+            return []
+        if self.backend != "mujoco_warp":
+            return [
+                self._forward_kinematics_cpu(
+                    qpos,
+                    qvel,
+                    joint_qpos_addrs=joint_qpos_addrs,
+                    joint_dof_addrs=joint_dof_addrs,
+                )
+                for qpos, qvel in zip(qpos_list, qvel_list, strict=True)
+            ]
+
+        normalized_qpos = [self.to_device(qpos) for qpos in qpos_list]
+        normalized_qvel = [
+            qvel.to(device=self.device, dtype=torch.float32, non_blocking=True).contiguous()
+            for qvel in qvel_list
         ]
+        lengths = [int(qpos.shape[0]) for qpos in normalized_qpos]
+        merged_qpos = torch.cat(normalized_qpos, dim=0)
+        merged_qvel = torch.cat(normalized_qvel, dim=0)
+        chunk_outputs: list[dict[str, torch.Tensor]] = []
+
+        for start in range(0, merged_qpos.shape[0], self.batch_size):
+            stop = min(merged_qpos.shape[0], start + self.batch_size)
+            chunk_outputs.append(
+                self._forward_kinematics_warp(
+                    merged_qpos[start:stop],
+                    merged_qvel[start:stop],
+                    joint_qpos_addrs=joint_qpos_addrs,
+                    joint_dof_addrs=joint_dof_addrs,
+                )
+            )
+
+        merged_outputs = {
+            key: torch.cat([chunk[key] for chunk in chunk_outputs], dim=0)
+            for key in chunk_outputs[0]
+        }
+        outputs: list[dict[str, torch.Tensor]] = []
+        start = 0
+        for length in lengths:
+            stop = start + length
+            outputs.append({key: value[start:stop] for key, value in merged_outputs.items()})
+            start = stop
+        return outputs
