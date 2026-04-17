@@ -47,7 +47,7 @@ Required fields:
 
 - `format_version`: integer format version
 - `dataset_name`: dataset identifier such as `lafan` or `sonic`
-- `mjcf`: Hugging Face MJCF reference
+- `mjcf`: MJCF reference string
 - `motions_subdir`: usually `"motions"`
 - `timestep`: dataset timestep in seconds
 - `qpos_dim`: MuJoCo `nq`
@@ -61,7 +61,7 @@ Example:
 {
   "format_version": 2,
   "dataset_name": "sonic",
-  "mjcf": "hf://elijahgalahad/g1_xmls@main/g1.xml",
+  "mjcf": "hf://elijahgalahad/g1_xmls@main/g1-mode_13_15.xml",
   "motions_subdir": "motions",
   "timestep": 0.008333333333333333,
   "qpos_dim": 36,
@@ -85,8 +85,9 @@ Example:
 }
 ```
 
-An `mjcf` value starting with `hf://` means the runtime should resolve the XML and
-meshes from the Hugging Face cache through `mjhub.resolve_mjcf_reference(...)`.
+Current converter output writes `mjcf` as an `hf://...` string. The runtime also accepts
+relative local XML paths for compatibility, but the canonical generated format is the
+Hugging Face reference form shown above.
 
 ## Motion Files
 
@@ -117,19 +118,22 @@ Everything clip-specific that is needed for playback is derived from:
 
 ## Current Converter Behavior
 
-The current converter code for both datasets writes the same final structure:
+The current converter entrypoints all write the same final structure:
 
-- `src/any4hdmi/datasets/lafan.py`
-- `src/any4hdmi/datasets/sonic.py`
+- `src/any4hdmi/scripts/preprocess/lafan.py`
+- `src/any4hdmi/scripts/preprocess/sonic.py`
+- `src/any4hdmi/scripts/preprocess/axellwppr.py`
 
-In both cases:
+In all three cases:
 
-1. A motion `.npz` is saved.
-2. A dataset `manifest.json` is written with a Hugging Face MJCF reference.
+1. One motion `.npz` is written per clip.
+2. One dataset-level `manifest.json` is written at the output root.
+3. `format_version` is `2`.
+4. `mjcf` is emitted as an `hf://...` reference by default.
 
 ## Compatibility Notes
 
 - Viewer and filtering code should rely on `manifest.json` plus motion `.npz`.
-- Dataset-global settings such as `fps` should live in `manifest.json`.
-- Older manifests that stored a local string path for `mjcf` are legacy format.
-- New manifests should use `format_version = 2` and the Hugging Face MJCF object shown above.
+- Dataset-global timing should live in `manifest.json -> timestep`.
+- Older manifests that stored a local string path for `mjcf` are still readable, but they are compatibility input, not the preferred emitted format.
+- New manifests should use `format_version = 2` and the `hf://...` MJCF string shown above.

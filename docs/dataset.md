@@ -1,344 +1,178 @@
-# Dataset Module
+# Dataset Runtime
 
-`src/any4hdmi/dataset` 现在只负责 any4hdmi 自己的数据集加载与 cache materialization。
+`src/any4hdmi/dataset/` 负责把 any4hdmi 的 `manifest.json + motions/**/*.npz` 数据集加载成运行时可用的 motion dataset。
+
+它的职责只包括：
+
+- 解析输入路径和 dataset root
+- 基于 `qpos` 构建或复用 FK cache
+- 暴露统一的 `sample_motion()` / `get_slice()` 数据集接口
 
 它不负责：
 
-- `MotionDataset`
-- `MotionData` 的上层语义封装
-- legacy dataset format 的加载
-
-这些现在应该由上层项目自己持有，例如 `active-adaptation/projects/hdmi/hdmi/tasks/motion.py`。
-
+- 源数据集转换
+- 上层任务逻辑或 reward / command 语义
+- `docs/legacy/` 里那批已经归档的旧 `online.py` 设计
 
 ## Public API
 
-当前对外暴露的接口定义在 [src/any4hdmi/dataset/__init__.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/__init__.py)：
+当前对外导出的符号定义在 [src/any4hdmi/dataset/__init__.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/__init__.py)：
 
-- `LoadedDatasetPayload`
+- `BaseDataset`
+- `DatasetIndex`
+- `MotionData`
+- `MotionSample`
+- `FullMotionDataset`
+- `WindowedMotionDataset`
+- `OnlineQposDataset`
+- `load_any4hdmi_dataset`
 - `resolve_input_paths`
-- `load_cached_any4hdmi_dataset`
 
-包根 [src/any4hdmi/__init__.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/__init__.py) 也只 re-export 这三个符号。
-
+其中 `OnlineQposDataset` 目前只是 `WindowedMotionDataset` 的别名。
 
 ## Module Layout
 
+### `base.py`
+
+[src/any4hdmi/dataset/base.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/base.py)
+
+定义当前 runtime dataset 统一接口和基础数据结构：
+
+- `MotionData`
+  一个 `TensorClass`，字段包括 `motion_id`、`step`、`body_pos_w`、`body_lin_vel_w`、`body_quat_w`、`body_ang_vel_w`、`joint_pos`、`joint_vel`
+- `DatasetIndex`
+  只保存平铺后的 `motion_id` / `step` 索引
+- `MotionSample`
+  `sample_motion()` 的返回值，包含 `motion_id`、`motion_len`、`start_t`
+- `BaseDataset`
+  抽象基类，统一要求实现 `to()`、`get_slice()`、`sample_motion()`
+
 ### `loading.py`
 
-文件位置：
 [src/any4hdmi/dataset/loading.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/loading.py)
 
-职责：
+负责输入解析和 dataset root 解析：
 
-- 定义 `LoadedDatasetPayload`
-- 解析输入路径
-- 识别 any4hdmi dataset root
-- 读取 `manifest.json`
-- 收集 `.npz` motion 文件路径
-- 构建 `LoadedDatasetPayload.data` 对应的 tensor container
-- 在加载时按 `asset_joint_names` 做 joint remap
+- `resolve_input_paths(base_dir, root_path)`
+- `find_any4hdmi_root(path)`
+- `load_any4hdmi_manifest(dataset_root)`
+- `resolve_any4hdmi_dataset_context(input_paths)`
+- `resolve_any4hdmi_motion_paths(input_paths)`
+- `resolve_source_fps(manifest)`
 
-核心接口：
+当前 canonical manifest 字段是 `timestep`。`resolve_source_fps()` 仍兼容读取 legacy 顶层 `fps`，但新格式默认从 `timestep` 反推。
 
-- `resolve_input_paths(base_dir, root_path) -> list[Path]`
-- `find_any4hdmi_root(path) -> Path | None`
-- `load_any4hdmi_manifest(dataset_root) -> dict`
-- `resolve_any4hdmi_dataset_context(input_paths) -> tuple[Path, dict]`
-- `resolve_any4hdmi_motion_paths(input_paths) -> tuple[Path, dict, list[Path]]`
-- `build_motion_data(...) -> tuple[MotionData, list[int], list[int]]`
-- `build_motion_data_from_fields(...) -> MotionData`
-- `apply_joint_mapping(...) -> list[str]`
-- `resolve_source_fps(manifest) -> float`
+### `fk_cache.py`
 
+[src/any4hdmi/dataset/fk_cache.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/fk_cache.py)
 
-### `cache.py`
+负责 FK cache 的构建与加载。
 
-文件位置：
-[src/any4hdmi/dataset/cache.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/cache.py)
+当前 cache 根目录：
 
-职责：
+- `<base_dir>/.cache/motion/qpos_online_v2/`
 
-- 根据 input paths 定位 any4hdmi dataset
-- 基于 manifest、motion 文件、MJCF 和 `target_fps` 生成 cache key
-- 首次加载时从 qpos motion materialize 出 FK 结果
-- 把 materialized data 持久化到磁盘
-- 下次命中 cache 时直接反序列化为 `LoadedDatasetPayload`
+核心流程：
 
-唯一对外公开的加载入口：
+1. 根据 `dataset_root`、`manifest.json`、MJCF 内容、`target_fps` 和 motion 文件 fingerprint 生成 cache key
+2. 读取 motion `qpos`
+3. 重建 `qvel`
+4. 通过 `interpolate_qpos_qvel_batch_torch(...)` 对齐到 `target_fps`
+5. 用 `FKRunner` 计算 FK
+6. 把结果写入 memmap 存储，并保存 `motion_index.json` / `cache_meta.json`
 
-- `load_cached_any4hdmi_dataset(input_paths, asset_joint_names, target_fps, base_dir) -> LoadedDatasetPayload`
-
-内部流程：
-
-1. `resolve_any4hdmi_dataset_context()` 和 `resolve_any4hdmi_motion_paths()` 找到 dataset root、manifest、motion 列表
-2. `_resolve_any4hdmi_mjcf_path()` 解析 MJCF
-3. `_make_qpos_cache_key()` 计算缓存键
-4. 若 cache 未命中，则 `_build_qpos_cache()`：
-   - 读取每个 motion 的 `qpos`
-   - 用 MuJoCo `mj_differentiatePos` 计算 `qvel`
-   - 用 `any4hdmi.fk.FKRunner` 做 FK materialization
-   - 用 `dataset.interpolation.interpolate()` 统一到 `target_fps`
-   - 汇总成一份连续 tensor 数据
-5. `_load_qpos_cache_entry()` 反序列化 cache，并在需要时做 joint remap
-
-
-### `interpolation.py`
-
-文件位置：
-[src/any4hdmi/dataset/interpolation.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/interpolation.py)
-
-职责：
-
-- 实现 motion field 的时间插值
-
-包含：
-
-- `lerp()` / `_lerp_torch()`
-- `slerp()` / `_slerp_torch()`
-- `interpolate(motion, source_fps, target_fps)`
-
-当前支持插值的 keys：
-
-- `body_pos_w`
-- `body_lin_vel_w`
-- `body_quat_w`
-- `body_ang_vel_w`
-- `joint_pos`
-- `joint_vel`
-
-如果传入其他 key，会直接抛 `NotImplementedError`。
-
-
-### `types.py`
-
-文件位置：
-[src/any4hdmi/dataset/types.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/types.py)
-
-职责：
-
-- 定义 `LoadedDatasetPayload.data` 使用的轻量 tensor container `MotionData`
-
-字段：
-
-- `motion_id`
-- `step`
-- `body_pos_w`
-- `body_lin_vel_w`
-- `body_quat_w`
-- `body_ang_vel_w`
-- `joint_pos`
-- `joint_vel`
-
-支持：
-
-- `len(data)`
-- `data.device`
-- `data.to(device)`
-- `data[idx]`
-
-说明：
-
-- 这个 `MotionData` 是 dataset loader 内部使用的数据载体
-- 它不是上层任务语义里的 `MotionDataset`
-- 如果上层项目需要自己的 `MotionData` / `MotionDataset` 类型，应该自己做转换
-
-
-## LoadedDatasetPayload
-
-`LoadedDatasetPayload` 定义在 [loading.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/loading.py)：
-
-```python
-@dataclass(frozen=True)
-class LoadedDatasetPayload:
-    body_names: list[str]
-    joint_names: list[str]
-    motion_paths: list[Path]
-    starts: list[int]
-    ends: list[int]
-    data: MotionData
-```
-
-语义：
-
-- `body_names`: FK 输出中的 body 名称顺序
-- `joint_names`: `joint_pos` / `joint_vel` 的列顺序
-- `motion_paths`: 对应的 motion `.npz` 文件列表
-- `starts` / `ends`: 每条 motion 在扁平化 `data` 里的边界
-- `data`: 按时间拼接后的 tensor 数据
-
-
-## Cache Format
-
-cache 根目录：
-
-- `<base_dir>/.cache/motion/qpos_fk/`
-
-每个 cache entry 的目录：
-
-- `<base_dir>/.cache/motion/qpos_fk/<cache_key>/`
-
-`cache_key` 由以下信息的哈希生成：
-
-- `dataset_root`
-- `manifest.json` 的 stat fingerprint
-- `mjcf` 文件的 stat fingerprint
-- `target_fps`
-- 每个 motion `.npz` 文件的 stat fingerprint
-- 若存在，同名 sidecar `.json` 的 stat fingerprint
-
-cache 现在始终使用 `TensorDict.memmap` 持久化。
-
-GPU promote 阈值定义在 [cache.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/cache.py)：
-
-```python
-CACHE_GPU_PROMOTE_THRESHOLD_BYTES = 16 * 1024**3
-```
-
-构建时会先扫描每个 motion 的插值后长度，估算 materialized FK 数据总字节数。
-
-读取时的逻辑是：
-
-- 总是先从 memmap 读
-- 如果当前有 CUDA
-- 并且 `estimated_bytes <= 16 GiB`
-- 并且当前 GPU 的 free memory 足够
-
-则把整份 loaded payload 直接搬到 GPU。
-
-一个 cache entry 当前包含：
-
-### `motion_index.json`
-
-JSON 元数据，字段包括：
+`FKCacheEntry` 暴露的是已经 materialize 好的字段：
 
 - `body_names`
 - `joint_names`
+- `motion_paths`
 - `starts`
 - `ends`
-- `motion_paths`
-- `source_fps`
-- `target_fps`
-- `total_length`
+- `storage_fields`
 
+### `interpolation.py`
 
-### `cache_meta.json`
+[src/any4hdmi/dataset/interpolation.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/interpolation.py)
 
-JSON 元数据，字段包括：
+负责 cache build 过程里的时间重采样，包括：
 
-- `cache_version`
-- `dataset_root`
-- `manifest_path`
-- `mjcf_path`
-- `target_fps`
+- `interpolate_qpos_qvel_batch_torch(...)`
+- `resampled_length(...)`
 
+这里服务的是 FK cache 构建，不是 viewer 播放逻辑。
 
-### `td/`
+### `loaders.py`
 
-`TensorDict.memmap(...)` 生成的磁盘映射张量目录。
+[src/any4hdmi/dataset/loaders.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/loaders.py)
 
-存储的 tensor 字段：
+当前统一加载入口是：
 
-- `motion_id`
-- `step`
-- `body_pos_w`
-- `body_lin_vel_w`
-- `body_quat_w`
-- `body_ang_vel_w`
-- `joint_pos`
-- `joint_vel`
-
-说明：
-
-- 这不是原始 qpos cache
-- 它存的是已经做完 FK 和插值后的 materialized motion tensors
-- 默认先以 CPU memmap 方式读取
-- 小 cache 会在 load 后被整体提升到 GPU
-
-
-### `ready.flag`
-
-纯文本标志文件，用于表示 cache entry 构建完成。
-
-
-`motion_index.json` 和 `cache_meta.json` 都会记录：
-
-- `storage: "memmap"`
-- `estimated_bytes`
-
-loader 读取时会调用：
-
-- `TensorDict.load_memmap(cache_entry_dir / "td")`
-
-然后按 `estimated_bytes` 和当前可用 GPU 内存决定是否调用 `.to("cuda")`。
-
-
-## Locking Behavior
-
-`cache.py` 使用目录锁避免并发重复构建：
-
-- lock 路径：
-  `<cache_root>/<cache_key>.lock`
-- 如果某个进程持有锁，其他进程会等待
-- 超时默认是 600 秒
-
-
-## Joint Remap Behavior
-
-`load_cached_any4hdmi_dataset()` 支持传入 `asset_joint_names`。
+```python
+load_any4hdmi_dataset(
+    *,
+    input_paths: list[Path],
+    target_fps: int,
+    base_dir: Path,
+    asset_joint_names: list[str] | None = None,
+    num_envs: int,
+    full_motion: bool = True,
+) -> BaseDataset
+```
 
 行为：
 
-- 如果 `asset_joint_names is None`，保持 cache 中原始 joint 顺序
-- 如果提供了 `asset_joint_names`，则：
-  - 共有 joint 会重排到 `asset_joint_names` 指定顺序
-  - cache 中存在但 asset 不存在的 joint 会追加到末尾
+- 总是先通过 `FKCache.from_inputs(...).get_or_build()` 拿到 cache
+- `full_motion=True` 时返回 `FullMotionDataset`
+- `full_motion=False` 时返回 `WindowedMotionDataset`
 
-这个 remap 只作用于：
+注意：
 
-- `joint_names`
-- `data.joint_pos`
-- `data.joint_vel`
+- `asset_joint_names` 目前被保留但未使用
+- 加载器现在不再做旧版 joint remap / legacy dataset format 兼容层
 
+### `full.py`
 
-## Current Scope
+[src/any4hdmi/dataset/full.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/full.py)
 
-`src/any4hdmi/dataset` 当前只面向 any4hdmi 自己的 dataset root layout：
+`FullMotionDataset` 直接把整份 cache 当作可随机访问的数据集使用。
 
-- `manifest.json`
-- `<motions_subdir>/**/*.npz`
+特点：
 
-它明确不处理：
+- `MotionSample.motion_id` 是真实的 dataset motion id
+- `get_slice()` 通过 `starts[motion_id] + local_step` 直接 gather
+- 适合整份数据都可直接放到运行设备上的场景
 
-- legacy `motion.npz + meta.json` layout
-- 上层任务侧的 `MotionDataset` 封装
-- 训练时的采样逻辑
+### `windowed.py`
 
-如果上层项目需要兼容 legacy layout，应该在上层自己做。
+[src/any4hdmi/dataset/windowed.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/windowed.py)
 
+`WindowedMotionDataset` 是当前在线运行时实现。
 
-## Typical Usage
+当前语义不是历史 `docs/legacy/` 里那套 `online.py` 状态机，而是：
 
-上层项目的典型调用方式：
+- 为每个 env 维护一份 `current` window 和一份 `next` window
+- `RUNTIME_MOTION_MAX_LEN = 512`
+- 用单线程 `ThreadPoolExecutor` 预取下一窗到 runtime pool
+- `sample_motion()` 在 non-rewind 时等待并 promote `next -> current`，随后再次调度新的 `next`
+- `get_slice()` 只从当前 window pool gather
 
-```python
-from any4hdmi import load_cached_any4hdmi_dataset, resolve_input_paths
+这里有一个当前实现上的重要约定：
 
-input_paths = resolve_input_paths(base_dir, root_path)
-payload = load_cached_any4hdmi_dataset(
-    input_paths=input_paths,
-    asset_joint_names=asset_joint_names,
-    target_fps=50,
-    base_dir=base_dir,
-)
-```
+- `WindowedMotionDataset.sample_motion()` 返回的 `motion_id` 是运行时 handle，当前等于 `env_ids`
+- 因此 `WindowedMotionDataset.get_slice(motion_ids=...)` 实际是在索引“env 对应的 current window”
+- 这和 `FullMotionDataset` 使用真实 motion id 的语义不同
 
-然后由上层把 `payload` 转换成自己的 `MotionData` / `MotionDataset` 类型。
+## Data Flow
 
+当前 dataset runtime 流程可以概括为：
 
-## Notes
+1. `resolve_input_paths(...)` 把 CLI / 上层传入路径规范化
+2. `FKCache` 解析 dataset root、manifest、motion 列表并构建或命中磁盘 cache
+3. `load_any4hdmi_dataset(...)` 选择返回 `FullMotionDataset` 或 `WindowedMotionDataset`
+4. 上层通过 `sample_motion()` 和 `get_slice()` 读取 motion 数据
 
-- `dataset/types.py` 里的 `MotionData` 目前仍然存在，因为 `LoadedDatasetPayload` 需要一个统一的数据载体
-- 但这个类型属于 loader 内部实现细节，不应再被当作 any4hdmi 的主对外抽象
-- 如果后续需要进一步收缩 API，可以继续把 `MotionData` 变成纯内部类型，而不是在文档中强调直接使用它
-- `memmap` 模式依赖 `tensordict`
+## Related Docs
+
+- 数据集磁盘格式见 [dataset_format.md](/home/elijah/Documents/projects/simple-tracking/any4hdmi/docs/dataset_format.md)
+- 转换、viewer、filter 流程见 [pipeline.md](/home/elijah/Documents/projects/simple-tracking/any4hdmi/docs/pipeline.md)
+- 已归档的旧 online 设计文档见 [legacy/README.md](/home/elijah/Documents/projects/simple-tracking/any4hdmi/docs/legacy/README.md)

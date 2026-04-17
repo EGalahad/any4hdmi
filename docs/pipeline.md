@@ -1,8 +1,9 @@
 # Pipeline
 
-This document explains how `any4hdmi` converts source motion datasets into the unified `qpos` format, how the viewer loads them, and how the MJCF is resolved.
+This document explains how `any4hdmi` converts source motion datasets into the unified `qpos` format, how the viewer and filter load them, and how the MJCF is resolved.
 
 For the final on-disk dataset format, including `manifest.json` and motion `.npz`, see [`dataset_format.md`](./dataset_format.md).
+For runtime dataset loading and FK cache behavior, see [`dataset.md`](./dataset.md).
 
 ## Overview
 
@@ -31,6 +32,9 @@ any4hdmi/
     sonic/
       manifest.json
       motions/
+    100style/
+      manifest.json
+      motions/
   src/any4hdmi/
 ```
 
@@ -39,7 +43,7 @@ This repo does not keep a checked-in `assets/` tree. MJCF XML and STL meshes are
 Default MJCF reference:
 
 - repo: `elijahgalahad/g1_xmls`
-- path: `g1.xml`
+- path: `g1-mode_13_15.xml`
 - revision: `main`
 
 ## Unified Motion Format
@@ -75,7 +79,7 @@ Default conversion settings:
 - dataset: `lafan`
 - FPS: `30`
 - MJCF repo: `elijahgalahad/g1_xmls`
-- MJCF path: `g1.xml`
+- MJCF path: `g1-mode_13_15.xml`
 - output: `output/lafan`
 
 Pipeline:
@@ -104,7 +108,7 @@ Default conversion settings:
 - Euler order: `xyz`
 - Euler frame: `extrinsic`
 - MJCF repo: `elijahgalahad/g1_xmls`
-- MJCF path: `g1.xml`
+- MJCF path: `g1-mode_13_15.xml`
 - output: `output/sonic`
 
 Pipeline:
@@ -118,6 +122,32 @@ Pipeline:
 7. Fill a `float32` `qpos` buffer.
 8. Save `qpos` as compressed `.npz`.
 9. Save/update dataset `manifest.json`.
+
+### 100STYLE / Axellwppr MotionDataset
+
+Source assumption:
+
+- input is either `100style.tar` or an extracted MotionDataset directory
+- root position, root quaternion, and joint positions already exist as TensorDict fields
+- source export uses 50 FPS by default
+
+Default conversion settings:
+
+- dataset: `100style`
+- FPS: `50`
+- MJCF repo: `elijahgalahad/g1_xmls`
+- MJCF path: `g1-mode_13_15.xml`
+- output: `output/100style`
+
+Pipeline:
+
+1. Open the tarball or extracted directory.
+2. Read `meta_motion.json`, `id_label.json`, and TensorDict memmaps.
+3. Build one clip record per labeled segment.
+4. Normalize root quaternions to MuJoCo `wxyz`.
+5. Fill a `float32` `qpos` buffer for each segment.
+6. Save one motion `.npz` per segment.
+7. Save/update dataset `manifest.json`.
 
 ## Euler Convention In SONIC
 
@@ -207,6 +237,14 @@ uv run any4hdmi-convert-sonic \
   --workers 8
 ```
 
+Convert 100STYLE from an Axellwppr tarball:
+
+```bash
+uv run any4hdmi-convert-axellwppr \
+  --input /home/elijah/Downloads/100style.tar \
+  --out-dir output/100style
+```
+
 Override the MJCF reference:
 
 ```bash
@@ -214,7 +252,7 @@ uv run any4hdmi-convert-lafan \
   --csv-dir ../lafan-process/LAFAN1_Retargeting_Dataset/g1 \
   --out-dir output/lafan \
   --mjcf-repo elijahgalahad/g1_xmls \
-  --mjcf-path g1.xml \
+  --mjcf-path g1-mode_13_15.xml \
   --mjcf-revision main
 ```
 
