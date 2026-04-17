@@ -6,6 +6,15 @@ from typing import Any
 import numpy as np
 import torch
 
+MOTION_DATA_FIELDS = (
+    "body_pos_w",
+    "body_lin_vel_w",
+    "body_quat_w",
+    "body_ang_vel_w",
+    "joint_pos",
+    "joint_vel",
+)
+
 
 def lerp(ts_target, ts_source, x):
     return np.stack(
@@ -69,6 +78,60 @@ def resampled_length(
         return int(length)
     duration = (length - 1) / float(source_fps)
     return max(1, int(math.floor(duration * float(target_fps) + 1e-9)) + 1)
+
+
+def interpolate_motion_data(
+    motion: dict[str, np.ndarray],
+    *,
+    source_fps: float,
+    target_fps: float,
+) -> dict[str, np.ndarray]:
+    if source_fps <= 0 or target_fps <= 0:
+        raise ValueError(
+            f"fps must be positive, got source_fps={source_fps}, target_fps={target_fps}"
+        )
+    if source_fps == target_fps:
+        return motion
+
+    extra_keys = set(motion.keys()) - set(MOTION_DATA_FIELDS)
+    if extra_keys:
+        raise NotImplementedError(
+            f"interpolation is not fully implemented for keys: {sorted(extra_keys)}"
+        )
+
+    length = int(motion["joint_pos"].shape[0])
+    if length <= 0:
+        raise ValueError(f"Expected positive motion length, got {length}")
+    if length == 1:
+        return motion
+
+    target_length = resampled_length(
+        length,
+        source_fps=source_fps,
+        target_fps=target_fps,
+    )
+    source_times = np.arange(length, dtype=np.float64) / float(source_fps)
+    target_times = np.arange(target_length, dtype=np.float64) / float(target_fps)
+
+    motion["body_pos_w"] = lerp(
+        target_times,
+        source_times,
+        motion["body_pos_w"].reshape(length, -1),
+    ).reshape(target_length, -1, 3)
+    motion["body_lin_vel_w"] = lerp(
+        target_times,
+        source_times,
+        motion["body_lin_vel_w"].reshape(length, -1),
+    ).reshape(target_length, -1, 3)
+    motion["body_quat_w"] = slerp(target_times, source_times, motion["body_quat_w"])
+    motion["body_ang_vel_w"] = lerp(
+        target_times,
+        source_times,
+        motion["body_ang_vel_w"].reshape(length, -1),
+    ).reshape(target_length, -1, 3)
+    motion["joint_pos"] = lerp(target_times, source_times, motion["joint_pos"])
+    motion["joint_vel"] = lerp(target_times, source_times, motion["joint_vel"])
+    return motion
 
 
 def slerp(ts_target, ts_source, quat):
