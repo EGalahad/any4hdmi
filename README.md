@@ -38,6 +38,14 @@ uv run any4hdmi-convert-sonic \
   --out-dir output/sonic
 ```
 
+Convert 100STYLE from the Axellwppr `MotionDataset` tarball:
+
+```bash
+uv run any4hdmi-convert-axellwppr \
+  --input /home/elijah/Downloads/100style.tar \
+  --out-dir output/100style
+```
+
 Override the MJCF reference if needed:
 
 ```bash
@@ -45,7 +53,7 @@ uv run any4hdmi-convert-sonic \
   --csv-dir data/seed/g1/csv \
   --out-dir output/sonic \
   --mjcf-repo elijahgalahad/g1_xmls \
-  --mjcf-path g1.xml \
+  --mjcf-path g1-mode_13_15.xml \
   --mjcf-revision main
 ```
 

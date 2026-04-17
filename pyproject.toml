@@ -10,18 +10,19 @@ requires-python = ">=3.10"
 dependencies = [
     "mjhub @ git+https://github.com/EGalahad/mjhub.git@main",
     "mujoco>=2.3.7",
-    "mujoco-warp",
+    "mujoco-warp==3.5.0.2",
     "numpy>=1.23",
     "tensordict",
     "torch",
     "tqdm>=4.66",
-    "warp-lang",
+    "warp-lang==1.12.0",
 ]
 
 [project.scripts]
 any4hdmi-view = "any4hdmi.scripts.viewer:main"
 any4hdmi-convert-lafan = "any4hdmi.scripts.preprocess.lafan:main"
 any4hdmi-convert-sonic = "any4hdmi.scripts.preprocess.sonic:main"
+any4hdmi-convert-axellwppr = "any4hdmi.scripts.preprocess.axellwppr:main"
 any4hdmi-filter-dataset = "any4hdmi.scripts.filter:main"
 
 [tool.setuptools]

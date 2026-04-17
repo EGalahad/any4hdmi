@@ -3,12 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import mujoco
-from mjhub import resolve_mjcf_reference as _resolve_mjcf_reference
+
+try:
+    from mjhub import resolve_asset_reference as _resolve_asset_reference
+except ImportError:
+    from mjhub import resolve_mjcf_reference as _resolve_asset_reference
 
 
 DEFAULT_BASE_JOINT_NAME = "floating_base_joint"
 DEFAULT_MJCF_REPO_ID = "elijahgalahad/g1_xmls"
-DEFAULT_MJCF_PATH = "g1.xml"
+DEFAULT_MJCF_PATH = "g1-mode_13_15.xml"
 DEFAULT_MJCF_REVISION = "main"
 MjcfInput = str | Path
 
@@ -26,7 +30,7 @@ def resolve_mjcf_path(mjcf: MjcfInput, *, dataset_root: str | Path | None = None
     normalized = normalize_mjcf_reference(mjcf, dataset_root=dataset_root)
     if isinstance(normalized, Path):
         return normalized
-    return _resolve_mjcf_reference(normalized)
+    return _resolve_asset_reference(normalized)
 
 
 def normalize_mjcf_reference(

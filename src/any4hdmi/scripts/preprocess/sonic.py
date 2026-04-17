@@ -8,8 +8,12 @@ import os
 from pathlib import Path
 
 import numpy as np
-from mjhub import resolve_mjcf_reference
 from tqdm import tqdm
+
+try:
+    from mjhub import resolve_asset_reference
+except ImportError:
+    from mjhub import resolve_mjcf_reference as resolve_asset_reference
 
 from any4hdmi.core.format import MOTION_DTYPE, MOTIONS_SUBDIR, repo_root, save_motion, write_manifest
 from any4hdmi.core.model import G1_JOINT_ORDER, base_qpos_adr, joint_qpos_adrs, load_model
@@ -252,7 +256,7 @@ def main() -> None:
         path=args.mjcf_path,
         revision=args.mjcf_revision,
     )
-    mjcf_path = resolve_mjcf_reference(mjcf_reference)
+    mjcf_path = resolve_asset_reference(mjcf_reference)
     model = load_model(mjcf_path)
     qpos_names = qpos_names_from_model(model)
     model_qpos_dim = model.nq
