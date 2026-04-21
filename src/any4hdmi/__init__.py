@@ -7,7 +7,6 @@ from any4hdmi.dataset import (
     OnlineQposDataset,
     WindowedMotionDataset,
     load_any4hdmi_dataset,
-    resolve_input_paths,
 )
 
 __all__ = [
@@ -19,5 +18,4 @@ __all__ = [
     "OnlineQposDataset",
     "WindowedMotionDataset",
     "load_any4hdmi_dataset",
-    "resolve_input_paths",
 ]

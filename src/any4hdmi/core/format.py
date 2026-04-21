@@ -74,6 +74,7 @@ def write_manifest(
     qpos_names: list[str],
     num_motions: int,
     source: dict[str, Any],
+    total_hours: float,
 ) -> Path:
     dataset_root = ensure_dir(dataset_root).resolve()
     manifest_path = dataset_root / MANIFEST_NAME
@@ -88,6 +89,7 @@ def write_manifest(
         "num_motions": int(num_motions),
         "source": source,
     }
+    payload["total_hours"] = float(total_hours)
     manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return manifest_path
 

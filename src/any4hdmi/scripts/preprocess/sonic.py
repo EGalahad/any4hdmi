@@ -174,7 +174,7 @@ def _convert_one(
     start: int,
     end: int,
     stride: int,
-) -> None:
+) -> int:
     header, motion = _load_csv(csv_path)
     resolved_end = end if end >= 0 else motion.shape[0]
     motion = motion[start : min(resolved_end, motion.shape[0]) : max(1, stride)]
@@ -191,6 +191,7 @@ def _convert_one(
     )
     rel_path = csv_path.relative_to(csv_dir).with_suffix(".npz")
     save_motion(out_dir / MOTIONS_SUBDIR / rel_path, qpos)
+    return int(qpos.shape[0])
 
 
 def _available_cpu_ids() -> tuple[int, ...] | None:
@@ -216,10 +217,11 @@ def _run_parallel(
     workers: int,
     task_kwargs: dict[str, object],
     cpu_ids: tuple[int, ...] | None,
-) -> None:
+) -> int:
     max_in_flight = max(workers * 4, 1)
     submitted = 0
     pending = set()
+    total_frames = 0
 
     with ProcessPoolExecutor(
         max_workers=workers,
@@ -235,8 +237,9 @@ def _run_parallel(
 
                 done, pending = wait(pending, return_when=FIRST_COMPLETED)
                 for future in done:
-                    future.result()
+                    total_frames += int(future.result())
                     progress.update(1)
+    return total_frames
 
 
 def main() -> None:
@@ -292,10 +295,11 @@ def main() -> None:
     }
 
     if worker_count == 1:
+        total_frames = 0
         for csv_path in tqdm(csv_files, desc="Converting SONIC", unit="file"):
-            _convert_one(csv_path, **task_kwargs)
+            total_frames += _convert_one(csv_path, **task_kwargs)
     else:
-        _run_parallel(csv_files, workers=worker_count, task_kwargs=task_kwargs, cpu_ids=cpu_ids)
+        total_frames = _run_parallel(csv_files, workers=worker_count, task_kwargs=task_kwargs, cpu_ids=cpu_ids)
 
     write_manifest(
         out_dir,
@@ -304,6 +308,7 @@ def main() -> None:
         timestep=1.0 / args.fps,
         qpos_names=qpos_names,
         num_motions=len(csv_files),
+        total_hours=total_frames / args.fps / 3600.0,
         source={
             "csv_dir": str(csv_dir),
             "pattern": args.pattern,

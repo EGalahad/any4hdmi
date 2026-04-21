@@ -29,6 +29,7 @@ name = "any4hdmi"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "huggingface-hub" },
     { name = "mjhub" },
     { name = "mujoco" },
     { name = "mujoco-warp" },
@@ -42,6 +43,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub", specifier = ">=0.30" },
     { name = "mjhub", git = "https://github.com/EGalahad/mjhub.git?rev=main" },
     { name = "mujoco", specifier = ">=2.3.7" },
     { name = "mujoco-warp", specifier = "==3.5.0.2" },

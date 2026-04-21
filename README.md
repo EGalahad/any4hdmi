@@ -63,6 +63,23 @@ Replay a converted motion:
 uv run any4hdmi-view --motion output/lafan/motions/dance1_subject2.npz
 ```
 
+Runtime loading also accepts a hosted dataset root:
+
+```python
+load_any4hdmi_dataset(
+  root_path="hf://elijahgalahad/any4hdmi-lafan",
+  target_fps=50,
+  base_dir=Path.cwd(),
+  num_envs=1,
+)
+```
+
+Upload a converted dataset folder to Hugging Face:
+
+```bash
+uv run any4hdmi-upload output/lafan elijahgalahad/any4hdmi-lafan
+```
+
 Headless check:
 
 ```bash

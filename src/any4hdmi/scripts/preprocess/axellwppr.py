@@ -301,6 +301,7 @@ def main() -> None:
             joint_pos=joint_pos,
         )
 
+        total_frames = 0
         for record in tqdm(records, desc="Converting 100STYLE", unit="motion"):
             qpos = _build_qpos_sequence(
                 model,
@@ -312,6 +313,7 @@ def main() -> None:
             )
             rel_path = _output_rel_path(record, args.source_root_name)
             save_motion(out_dir / MOTIONS_SUBDIR / rel_path, qpos)
+            total_frames += int(qpos.shape[0])
 
     source_payload = {
         "input": str(Path(args.input).expanduser()),
@@ -327,6 +329,7 @@ def main() -> None:
         timestep=1.0 / args.fps,
         qpos_names=qpos_names,
         num_motions=len(records),
+        total_hours=total_frames / args.fps / 3600.0,
         source=source_payload,
     )
 

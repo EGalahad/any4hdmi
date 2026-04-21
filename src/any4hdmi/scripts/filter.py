@@ -643,6 +643,11 @@ def main() -> None:
         source["filter"]["num_workers"] = int(args.num_workers)
         source["filter"]["prefetch_factor"] = int(args.prefetch_factor)
         source["filter"]["copy_workers"] = int(args.copy_workers)
+        kept_total_frames = sum(
+            int(entry["num_frames"] or 0)
+            for entry in motion_entries
+            if entry["status"] == "kept"
+        )
         if keep_filenames_path is not None:
             source["filter"]["keep_filenames_path"] = str(keep_filenames_path)
             source["filter"]["keep_filenames_total"] = len(keep_names)
@@ -654,6 +659,7 @@ def main() -> None:
             timestep=manifest.timestep,
             qpos_names=list(manifest.payload["qpos_names"]),
             num_motions=kept_count,
+            total_hours=kept_total_frames * manifest.timestep / 3600.0,
             source=source,
         )
         (output_root / "manifest.source.json").write_text(

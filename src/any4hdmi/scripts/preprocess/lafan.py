@@ -110,6 +110,7 @@ def main() -> None:
         raise FileNotFoundError(f"No CSV files matched {args.pattern!r} under {csv_dir}")
 
     num_motions = 0
+    total_frames = 0
     for csv_path in tqdm(csv_files, desc="Converting LAFAN", unit="file"):
         motion = _load_csv(csv_path)
         end = args.end if args.end >= 0 else motion.shape[0]
@@ -119,6 +120,7 @@ def main() -> None:
         rel_path = csv_path.relative_to(csv_dir).with_suffix(".npz")
         save_motion(out_dir / MOTIONS_SUBDIR / rel_path, qpos)
         num_motions += 1
+        total_frames += int(qpos.shape[0])
 
     write_manifest(
         out_dir,
@@ -127,6 +129,7 @@ def main() -> None:
         timestep=1.0 / args.fps,
         qpos_names=qpos_names,
         num_motions=num_motions,
+        total_hours=total_frames / args.fps / 3600.0,
         source={
             "csv_dir": str(csv_dir),
             "pattern": args.pattern,

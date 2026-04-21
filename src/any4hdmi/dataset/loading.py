@@ -11,6 +11,8 @@ from tqdm import tqdm
 
 LEGACY_MOTION_NAME = "motion.npz"
 LEGACY_META_NAME = "meta.json"
+HF_DATASET_SCHEME = "hf://"
+DEFAULT_HF_DATASET_REVISION = "main"
 DatasetKind = Literal["any4hdmi", "legacy"]
 
 
@@ -23,14 +25,63 @@ class DatasetContext:
     legacy_meta: dict[str, Any] | None = None
 
 
+def _parse_hf_dataset_reference(root_path: str) -> tuple[str, str, str]:
+    raw_reference = root_path[len(HF_DATASET_SCHEME) :]
+    parts = raw_reference.split("/", 2)
+    if len(parts) < 2:
+        raise ValueError(
+            "Invalid Hugging Face dataset URI. Expected "
+            "'hf://<namespace>/<repo>' or "
+            "'hf://<namespace>/<repo>@<revision>/<path>'."
+        )
+
+    namespace = parts[0]
+    repo_and_revision = parts[1]
+    repo_path = parts[2] if len(parts) == 3 else ""
+    repo_name, sep, revision = repo_and_revision.partition("@")
+    repo_id = f"{namespace}/{repo_name}"
+    if not sep:
+        revision = DEFAULT_HF_DATASET_REVISION
+
+    if not namespace or not repo_name:
+        raise ValueError("Invalid Hugging Face dataset URI. namespace and repo must both be non-empty.")
+    return repo_id, revision, repo_path
+
+
+def _snapshot_download(*, repo_id: str, revision: str) -> Path:
+    from huggingface_hub import snapshot_download
+
+    return Path(
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            revision=revision,
+        )
+    ).resolve()
+
+
+def _resolve_hf_dataset_path(root_path: str) -> Path:
+    repo_id, revision, repo_path = _parse_hf_dataset_reference(root_path)
+    snapshot_root = _snapshot_download(repo_id=repo_id, revision=revision)
+    resolved_path = (snapshot_root / repo_path) if repo_path else snapshot_root
+    if not resolved_path.exists():
+        raise FileNotFoundError(
+            f"Dataset path {repo_path or '.'!r} was not found in Hugging Face dataset repo "
+            f"{repo_id!r} at revision {revision!r}"
+        )
+    return resolved_path.absolute()
+
+
 def resolve_input_paths(base_dir: Path, root_path: str | list[str] | Path | list[Path]) -> list[Path]:
-    if isinstance(root_path, (str, Path)):
-        raw_paths = [Path(root_path)]
-    else:
-        raw_paths = [Path(path) for path in root_path]
+    raw_paths = [root_path] if isinstance(root_path, (str, Path)) else list(root_path)
 
     resolved_paths: list[Path] = []
-    for path in raw_paths:
+    for raw_path in raw_paths:
+        if isinstance(raw_path, str) and raw_path.startswith(HF_DATASET_SCHEME):
+            resolved_paths.append(_resolve_hf_dataset_path(raw_path))
+            continue
+
+        path = Path(raw_path)
         expanded = path.expanduser()
         if not expanded.is_absolute():
             expanded = base_dir / expanded
@@ -84,18 +135,18 @@ def _collect_any4hdmi_motion_paths(
         if input_path.is_file():
             if input_path.suffix != ".npz":
                 raise ValueError(f"Expected a .npz motion file under any4hdmi root, got {input_path}")
-            motion_paths.add(input_path.resolve())
+            motion_paths.add(input_path.absolute())
             continue
 
         scan_root = motions_root if input_path == dataset_root else input_path
         motion_paths.update(
-            path.resolve()
+            path.absolute()
             for path in tqdm(scan_root.rglob("*.npz"), desc=f"Scanning {scan_root.name}", unit="file")
         )
 
     if not motion_paths:
         motion_paths.update(
-            path.resolve()
+            path.absolute()
             for path in tqdm(motions_root.rglob("*.npz"), desc=f"Scanning {motions_root.name}", unit="file")
         )
     motion_paths_list = sorted(motion_paths)
@@ -112,11 +163,11 @@ def resolve_legacy_motion_paths(input_paths: list[Path]) -> list[Path]:
                 raise ValueError(
                     f"Expected a legacy {LEGACY_MOTION_NAME} file, got {input_path}"
                 )
-            motion_paths.add(input_path.resolve())
+            motion_paths.add(input_path.absolute())
             continue
 
         motion_paths.update(
-            path.resolve()
+            path.absolute()
             for path in tqdm(
                 input_path.rglob(LEGACY_MOTION_NAME),
                 desc=f"Scanning {input_path.name or input_path}",
@@ -148,7 +199,7 @@ def load_legacy_meta(motion_paths: list[Path]) -> dict[str, Any]:
 
 
 def _common_parent(paths: list[Path]) -> Path:
-    return Path(os.path.commonpath([str(path.resolve()) for path in paths])).resolve()
+    return Path(os.path.commonpath([str(path.absolute()) for path in paths])).absolute()
 
 
 def resolve_dataset_context(input_paths: list[Path]) -> DatasetContext:
