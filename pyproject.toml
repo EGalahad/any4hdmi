@@ -11,7 +11,7 @@ dependencies = [
     "huggingface_hub>=0.30",
     "mjhub @ git+https://github.com/EGalahad/mjhub.git@main",
     "mujoco>=2.3.7",
-    "mujoco-warp==3.5.0.2",
+    "mujoco-warp>=3.5.0.2",
     "numpy>=1.23",
     "tensordict",
     "torch",
