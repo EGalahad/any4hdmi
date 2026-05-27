@@ -8,15 +8,19 @@ version = "0.1.0"
 description = "Unified qpos-based motion conversion and MuJoCo playback for HDMI-related datasets."
 requires-python = ">=3.10"
 dependencies = [
-    "huggingface_hub>=0.30",
+    "huggingface_hub",
     "mjhub @ git+https://github.com/EGalahad/mjhub.git@main",
-    "mujoco>=2.3.7",
-    "mujoco-warp>=3.5.0.2",
-    "numpy>=1.23",
+    "mujoco",
+    "numpy",
     "tensordict",
     "torch",
-    "tqdm>=4.66",
-    "warp-lang==1.12.0",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+warp = [
+    "mujoco-warp>=3.5.0.2",
+    "warp-lang",
 ]
 
 [project.scripts]

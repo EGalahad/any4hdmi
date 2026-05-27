@@ -26,7 +26,6 @@
 - `WindowedMotionDataset`
 - `OnlineQposDataset`
 - `load_any4hdmi_dataset`
-- `resolve_input_paths`
 
 其中 `OnlineQposDataset` 目前只是 `WindowedMotionDataset` 的别名。
 
@@ -51,14 +50,15 @@
 
 [src/any4hdmi/dataset/loading.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/loading.py)
 
-负责输入解析和 dataset root 解析：
+负责内部输入解析和 dataset root 解析：
 
-- `resolve_input_paths(base_dir, root_path)`
 - `find_any4hdmi_root(path)`
 - `load_any4hdmi_manifest(dataset_root)`
 - `resolve_any4hdmi_dataset_context(input_paths)`
 - `resolve_any4hdmi_motion_paths(input_paths)`
 - `resolve_source_fps(manifest)`
+
+其中 `resolve_input_paths(base_dir, root_path)` 仍保留在这个模块里作为内部 helper，由 `load_any4hdmi_dataset(...)` 调用；它不再属于 package-level public API。
 
 当前 canonical manifest 字段是 `timestep`。`resolve_source_fps()` 仍兼容读取 legacy 顶层 `fps`，但新格式默认从 `timestep` 反推。
 
@@ -110,7 +110,7 @@
 ```python
 load_any4hdmi_dataset(
     *,
-    input_paths: list[Path],
+    root_path: str | Path | list[str] | list[Path],
     target_fps: int,
     base_dir: Path,
     asset_joint_names: list[str] | None = None,
@@ -121,12 +121,14 @@ load_any4hdmi_dataset(
 
 行为：
 
+- 先在内部通过 `resolve_input_paths(base_dir, root_path)` 规范化输入路径
 - 总是先通过 `FKCache.from_inputs(...).get_or_build()` 拿到 cache
 - `full_motion=True` 时返回 `FullMotionDataset`
 - `full_motion=False` 时返回 `WindowedMotionDataset`
 
 注意：
 
+- `root_path` 可以是本地路径，也可以是 `hf://<namespace>/<repo>[@revision][/subpath]`
 - `asset_joint_names` 目前被保留但未使用
 - 加载器现在不再做旧版 joint remap / legacy dataset format 兼容层
 
@@ -166,7 +168,7 @@ load_any4hdmi_dataset(
 
 当前 dataset runtime 流程可以概括为：
 
-1. `resolve_input_paths(...)` 把 CLI / 上层传入路径规范化
+1. `load_any4hdmi_dataset(...)` 在内部规范化 CLI / 上层传入路径
 2. `FKCache` 解析 dataset root、manifest、motion 列表并构建或命中磁盘 cache
 3. `load_any4hdmi_dataset(...)` 选择返回 `FullMotionDataset` 或 `WindowedMotionDataset`
 4. 上层通过 `sample_motion()` 和 `get_slice()` 读取 motion 数据

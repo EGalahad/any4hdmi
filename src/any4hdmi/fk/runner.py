@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
+from typing import Any
 
 import mujoco
 import numpy as np
 import torch
-
-import warp as wp
-import mujoco_warp as mjw
 
 from any4hdmi.core.model import body_names_from_model, hinge_joint_info
 
@@ -50,9 +49,47 @@ class FKRunner:
     def _default_device() -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    @staticmethod
+    def _load_mujoco_warp() -> tuple[Any, Any] | None:
+        try:
+            import warp as wp
+            import mujoco_warp as mjw
+        except ImportError:
+            return None
+        return wp, mjw
+
+    def _warn_mujoco_warp_fallback(self) -> None:
+        if self._warned_about_warp_fallback:
+            return
+        warnings.warn(
+            "mujoco_warp/warp is unavailable; falling back to CPU MuJoCo FK.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        self._warned_about_warp_fallback = True
+
+    def _use_mujoco_backend(self) -> None:
+        self.device = torch.device("cpu")
+        self.backend = "mujoco"
+        self._wp = None
+        self._mjw = None
+        self._warp_model = None
+        self._warp_data = None
+        self._padded_qpos = None
+        self._padded_qvel = None
+
     def to(self, device: torch.device | str) -> FKRunner:
         requested_device = torch.device(device)
         if requested_device.type == "cuda":
+            warp_modules = self._load_mujoco_warp()
+            if warp_modules is None:
+                self._warn_mujoco_warp_fallback()
+                self._use_mujoco_backend()
+                self.joint_qpos_addrs = self.joint_qpos_addrs.to(device=self.device)
+                self.joint_dof_addrs = self.joint_dof_addrs.to(device=self.device)
+                return self
+
+            wp, mjw = warp_modules
             self._wp = wp
             self._mjw = mjw
             self._warp_model = mjw.put_model(self.model)
@@ -70,14 +107,7 @@ class FKRunner:
             )
             self.backend = "mujoco_warp"
         else:
-            self.device = torch.device("cpu")
-            self.backend = "mujoco"
-            self._wp = None
-            self._mjw = None
-            self._warp_model = None
-            self._warp_data = None
-            self._padded_qpos = None
-            self._padded_qvel = None
+            self._use_mujoco_backend()
 
         self.joint_qpos_addrs = self.joint_qpos_addrs.to(device=self.device)
         self.joint_dof_addrs = self.joint_dof_addrs.to(device=self.device)
