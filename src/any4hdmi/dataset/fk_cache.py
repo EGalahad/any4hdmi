@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -55,6 +56,18 @@ _MOTION_DATA_FIELD_NAMES = (
     "joint_pos",
     "joint_vel",
 )
+
+
+def _release_cache_build_cuda_memory() -> None:
+    gc.collect()
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    except RuntimeError:
+        pass
 
 
 @dataclass(frozen=True)
@@ -727,6 +740,7 @@ class FKCache:
         return self.cache_root / f"{self.cache_key}.lock"
 
     def get_or_build(self) -> FKCacheEntry:
+        built_cache = False
         if not self.ready_flag.is_file():
             owns_lock = _acquire_cache_lock(self.lock_dir, self.ready_flag)
             if owns_lock:
@@ -760,6 +774,7 @@ class FKCache:
                         shutil.rmtree(tmp_entry_dir)
                     else:
                         tmp_entry_dir.rename(self.cache_entry_dir)
+                    built_cache = True
                 finally:
                     if tmp_entry_dir.exists():
                         shutil.rmtree(tmp_entry_dir, ignore_errors=True)
@@ -768,6 +783,8 @@ class FKCache:
             elif not self.ready_flag.is_file():
                 raise RuntimeError(f"Cache lock released but cache is not ready: {self.cache_entry_dir}")
 
+        if built_cache:
+            _release_cache_build_cuda_memory()
         print(f"Loading motion cache from {self.cache_entry_dir}")
         return self.load()
 

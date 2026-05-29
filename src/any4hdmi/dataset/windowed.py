@@ -13,8 +13,7 @@ from any4hdmi.dataset.fk_cache import FKCacheEntry
 
 
 RUNTIME_MOTION_MAX_LEN = 512
-# NEXT_WINDOW_DEVICE = torch.device("cpu")
-NEXT_WINDOW_DEVICE = None
+NEXT_WINDOW_DEVICE = torch.device("cpu")
 NEXT_WINDOW_FLOAT_DTYPE = torch.float16
 CURRENT_WINDOW_FLOAT_DTYPE = torch.float32
 
@@ -144,8 +143,15 @@ class WindowedMotionDataset(BaseDataset):
         )
 
     def __del__(self) -> None:
-        if hasattr(self, "_executor"):
-            self._executor.shutdown(wait=False, cancel_futures=True)
+        executor = getattr(self, "_executor", None)
+        if executor is None:
+            return
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            # Interpreter shutdown can tear down concurrent.futures internals
+            # before dataset objects are collected.
+            pass
 
     def _allocate_window_pool(
         self,
@@ -272,8 +278,7 @@ class WindowedMotionDataset(BaseDataset):
         if count == 0:
             return self._empty_motion_sample()
         motion_id = torch.zeros((count,), dtype=torch.long, device=self.device)
-        source_len = self.lengths[motion_id]
-        window_len = torch.minimum(source_len, torch.full_like(source_len, RUNTIME_MOTION_MAX_LEN))
+        window_len = torch.full_like(motion_id, RUNTIME_MOTION_MAX_LEN)
         start_t = torch.zeros((count,), dtype=torch.long, device=self.device)
         return MotionSample(
             motion_id=motion_id,
@@ -391,7 +396,9 @@ class WindowedMotionDataset(BaseDataset):
         sampled_motion_ids = self.data.motion_id[sampled_frame_ids].long()
         sampled_source_start_t = self.data.step[sampled_frame_ids].long()
         sampled_source_len = self.lengths[sampled_motion_ids].long()
-        sampled_window_len = (sampled_source_len - sampled_source_start_t).clamp_max_(RUNTIME_MOTION_MAX_LEN)
+        max_source_start_t = (sampled_source_len - RUNTIME_MOTION_MAX_LEN).clamp_min_(0)
+        sampled_source_start_t = torch.minimum(sampled_source_start_t, max_source_start_t)
+        sampled_window_len = torch.full_like(sampled_source_start_t, RUNTIME_MOTION_MAX_LEN)
         return sampled_motion_ids, sampled_source_start_t, sampled_window_len
 
     def _assign_current_window_metadata(
@@ -437,7 +444,8 @@ class WindowedMotionDataset(BaseDataset):
             raise ValueError("window batch load requires a non-empty batch")
 
         global_index = global_start.unsqueeze(1) + self._window_steps_cpu.unsqueeze(0)
-        global_index.clamp_max_(self._storage_total_length - 1)
+        global_end = self._storage_ends_cpu[motion_ids].sub(1).unsqueeze(1)
+        global_index = torch.minimum(global_index, global_end)
         flat_index = global_index.reshape(-1)
 
         def gather_float_field(field_name: str) -> torch.Tensor:
@@ -683,6 +691,7 @@ class WindowedMotionDataset(BaseDataset):
         local_idx.clamp_max_(motion_lengths.unsqueeze(1) - 1)
         if self._fake_get_slice:
             return self._build_default_pose_motion_data(motion_ids, local_idx)
+
         motion_data = self._current_window[motion_ids.unsqueeze(1), local_idx]
         self._record_stats(profile_name or "get_slice", current_hit=True)
         return motion_data
