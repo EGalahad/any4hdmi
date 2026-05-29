@@ -47,6 +47,19 @@ class SegmentRecord:
     frame_end: int
 
 
+@dataclass(frozen=True)
+class MotionRecord:
+    source_path: str
+    segment_start: int
+    segment_end: int
+    segments: tuple[SegmentRecord, ...]
+    use_span_suffix: bool = False
+
+    @property
+    def frame_count(self) -> int:
+        return sum(segment.frame_end - segment.frame_start for segment in self.segments)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -191,6 +204,41 @@ def _build_segment_records(meta_motion: dict[str, Any], id_labels: list[dict[str
     return records
 
 
+def _build_motion_records(records: list[SegmentRecord]) -> list[MotionRecord]:
+    groups: dict[str, list[SegmentRecord]] = {}
+    source_order: list[str] = []
+    for record in records:
+        if record.source_path not in groups:
+            groups[record.source_path] = []
+            source_order.append(record.source_path)
+        groups[record.source_path].append(record)
+
+    motion_records: list[MotionRecord] = []
+    for source_path in source_order:
+        segments = sorted(groups[source_path], key=lambda item: (item.segment_start, item.segment_end))
+        runs: list[list[SegmentRecord]] = [[segments[0]]]
+        for current in segments[1:]:
+            previous = runs[-1][-1]
+            if previous.segment_end == current.segment_start:
+                runs[-1].append(current)
+            else:
+                runs.append([current])
+
+        use_span_suffix_for_source = len(runs) > 1
+        for run in runs:
+            use_span_suffix = use_span_suffix_for_source or run[0].segment_start != 0
+            motion_records.append(
+                MotionRecord(
+                    source_path=source_path,
+                    segment_start=run[0].segment_start,
+                    segment_end=run[-1].segment_end,
+                    segments=tuple(run),
+                    use_span_suffix=use_span_suffix,
+                )
+            )
+    return motion_records
+
+
 def _normalize_quaternions_wxyz(quaternions: np.ndarray) -> np.ndarray:
     quaternions = np.asarray(quaternions, dtype=MOTION_DTYPE)
     norms = np.linalg.norm(quaternions, axis=-1, keepdims=True)
@@ -235,8 +283,10 @@ def _source_relative_path(source_path: str, source_root_name: str) -> Path:
     return Path(raw_path.name)
 
 
-def _output_rel_path(record: SegmentRecord, source_root_name: str) -> Path:
+def _output_rel_path(record: MotionRecord, source_root_name: str) -> Path:
     source_rel = _source_relative_path(record.source_path, source_root_name)
+    if not record.use_span_suffix:
+        return source_rel
     filename = f"{source_rel.stem}__{record.segment_start:06d}_{record.segment_end:06d}.npz"
     return source_rel.parent / filename
 
@@ -258,9 +308,10 @@ def _validate_meta(
     expected_joints = len(meta_motion["joint_names"])
     if joint_pos.shape != (expected_frames, expected_joints):
         raise ValueError(f"Expected joint_pos shape {(expected_frames, expected_joints)}, got {joint_pos.shape}")
-    if records and records[-1].frame_end > expected_frames:
+    max_frame_end = max((record.frame_end for record in records), default=0)
+    if max_frame_end > expected_frames:
         raise ValueError(
-            f"Segment frame range exceeds TensorDict storage: {records[-1].frame_end} > {expected_frames}"
+            f"Segment frame range exceeds TensorDict storage: {max_frame_end} > {expected_frames}"
         )
 
 
@@ -287,6 +338,7 @@ def main() -> None:
         td_meta = _load_json(dataset_root / "_tensordict" / "meta.json")
         id_labels = _load_json(dataset_root / "id_label.json")
         records = _build_segment_records(meta_motion, id_labels)
+        motion_records = _build_motion_records(records)
         hinge_qpos_adrs = joint_qpos_adrs(model, list(meta_motion["joint_names"]))
 
         root_pos_w = _load_tensordict_field(dataset_root, "root_pos_w", td_meta)
@@ -302,15 +354,21 @@ def main() -> None:
         )
 
         total_frames = 0
-        for record in tqdm(records, desc="Converting 100STYLE", unit="motion"):
-            qpos = _build_qpos_sequence(
-                model,
-                np.asarray(root_pos_w[record.frame_start : record.frame_end], dtype=MOTION_DTYPE),
-                np.asarray(root_quat_w[record.frame_start : record.frame_end], dtype=MOTION_DTYPE),
-                np.asarray(joint_pos[record.frame_start : record.frame_end], dtype=MOTION_DTYPE),
-                base_adr=base_adr,
-                hinge_qpos_adrs=hinge_qpos_adrs,
-            )
+        for record in tqdm(motion_records, desc="Converting source motions", unit="motion"):
+            qpos_chunks = [
+                _build_qpos_sequence(
+                    model,
+                    np.asarray(root_pos_w[segment.frame_start : segment.frame_end], dtype=MOTION_DTYPE),
+                    np.asarray(root_quat_w[segment.frame_start : segment.frame_end], dtype=MOTION_DTYPE),
+                    np.asarray(joint_pos[segment.frame_start : segment.frame_end], dtype=MOTION_DTYPE),
+                    base_adr=base_adr,
+                    hinge_qpos_adrs=hinge_qpos_adrs,
+                )
+                for segment in record.segments
+            ]
+            qpos = qpos_chunks[0] if len(qpos_chunks) == 1 else np.concatenate(qpos_chunks, axis=0)
+            if qpos.shape[0] != record.frame_count:
+                raise ValueError(f"Concatenated qpos length mismatch for {record.source_path}")
             rel_path = _output_rel_path(record, args.source_root_name)
             save_motion(out_dir / MOTIONS_SUBDIR / rel_path, qpos)
             total_frames += int(qpos.shape[0])
@@ -319,8 +377,9 @@ def main() -> None:
         "input": str(Path(args.input).expanduser()),
         "fps": args.fps,
         "format": "axell_motiondataset_memmap",
-        "segment_naming": "source_path + segment_start/end",
+        "segment_naming": "source_path; contiguous chunks concatenated",
         "source_root_name": args.source_root_name,
+        "num_input_segments": len(records),
     }
     write_manifest(
         out_dir,
@@ -328,7 +387,7 @@ def main() -> None:
         mjcf=mjcf_reference,
         timestep=1.0 / args.fps,
         qpos_names=qpos_names,
-        num_motions=len(records),
+        num_motions=len(motion_records),
         total_hours=total_frames / args.fps / 3600.0,
         source=source_payload,
     )
