@@ -113,9 +113,12 @@ load_any4hdmi_dataset(
     root_path: str | Path | list[str] | list[Path],
     target_fps: int,
     base_dir: Path,
-    asset_joint_names: list[str] | None = None,
+    body_names: list[str] | None = None,
+    joint_names: list[str] | None = None,
     num_envs: int,
     full_motion: bool = True,
+    windowed_next_window_device: str | torch.device | None = "current",
+    windowed_pin_window_load: bool = True,
 ) -> BaseDataset
 ```
 
@@ -125,11 +128,11 @@ load_any4hdmi_dataset(
 - 总是先通过 `FKCache.from_inputs(...).get_or_build()` 拿到 cache
 - `full_motion=True` 时返回 `FullMotionDataset`
 - `full_motion=False` 时返回 `WindowedMotionDataset`
+- `body_names` / `joint_names` 不为空时，只保留这些 motion cache fields
 
 注意：
 
 - `root_path` 可以是本地路径，也可以是 `hf://<namespace>/<repo>[@revision][/subpath]`
-- `asset_joint_names` 目前被保留但未使用
 - 加载器现在不再做旧版 joint remap / legacy dataset format 兼容层
 
 ### `full.py`

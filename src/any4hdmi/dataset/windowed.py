@@ -13,7 +13,7 @@ from any4hdmi.dataset.fk_cache import FKCacheEntry
 
 
 RUNTIME_MOTION_MAX_LEN = 512
-NEXT_WINDOW_DEVICE = torch.device("cpu")
+NEXT_WINDOW_DEVICE: torch.device | None = None
 NEXT_WINDOW_FLOAT_DTYPE = torch.float16
 CURRENT_WINDOW_FLOAT_DTYPE = torch.float32
 
@@ -40,6 +40,33 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _next_window_device(runtime_device: torch.device, configured: str | torch.device | None = None) -> torch.device:
+    if configured is not None:
+        value = str(configured).strip().lower()
+        if value in {"current", "runtime", "device", "gpu", "cuda"}:
+            return runtime_device
+        if value == "cpu":
+            return torch.device("cpu")
+        return torch.device(configured)
+
+    raw = os.environ.get("ANY4HDMI_NEXT_WINDOW_DEVICE")
+    if raw is None:
+        return NEXT_WINDOW_DEVICE or runtime_device
+    value = raw.strip().lower()
+    if value in {"current", "runtime", "device", "gpu", "cuda"}:
+        return runtime_device
+    if value == "cpu":
+        return torch.device("cpu")
+    return NEXT_WINDOW_DEVICE or runtime_device
+
+
 @dataclass
 class _PrefetchProfileStats:
     calls: int = 0
@@ -58,6 +85,9 @@ class _PrefetchProfileStats:
     pool_miss_motions: int = 0
     wait_next_ready_calls: int = 0
     wait_next_ready_wall_time_s: float = 0.0
+    promote_calls: int = 0
+    promote_envs_total: int = 0
+    promote_wall_time_s: float = 0.0
 
 
 @dataclass
@@ -88,6 +118,8 @@ class WindowedMotionDataset(BaseDataset):
         storage_fields: dict[str, torch.Tensor],
         num_envs: int,
         device: torch.device | str | None = None,
+        next_window_device: str | torch.device | None = "current",
+        pin_window_load: bool = True,
     ) -> None:
         if num_envs <= 0:
             raise ValueError(f"num_envs must be positive, got {num_envs}")
@@ -113,6 +145,11 @@ class WindowedMotionDataset(BaseDataset):
         self._profile_print_every = _env_int("ANY4HDMI_PROFILE_CACHE_IDS_PRINT_EVERY", 50)
         self._profile_focus = os.environ.get("ANY4HDMI_PROFILE_CACHE_IDS_FOCUS")
         self._profile_stats: dict[str, _PrefetchProfileStats] = {}
+        self._configured_next_window_device = next_window_device
+        self._pin_window_load = _env_bool("ANY4HDMI_PIN_WINDOW_LOAD", pin_window_load)
+        self._window_load_scratch: dict[str, torch.Tensor] = {}
+        self._pin_window_load_disabled = False
+        self._reported_next_window_device: torch.device | None = None
 
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="any4hdmi-motion-pool")
         self._pending_loads: list[_PendingMotionLoad] = []
@@ -122,6 +159,8 @@ class WindowedMotionDataset(BaseDataset):
             print("[any4hdmi][online_dataset] ANY4HDMI_FAKE_SAMPLE_MOTION=1, returning canonical MotionSample")
         if self._fake_get_slice:
             print("[any4hdmi][online_dataset] ANY4HDMI_FAKE_GET_SLICE=1, returning default pose MotionData")
+        if self._pin_window_load:
+            print("[any4hdmi][online_dataset] pin_window_load=1")
 
     @classmethod
     def from_cache_entry(
@@ -130,6 +169,8 @@ class WindowedMotionDataset(BaseDataset):
         *,
         num_envs: int,
         device: torch.device | str | None = None,
+        next_window_device: str | torch.device | None = "current",
+        pin_window_load: bool = True,
     ) -> WindowedMotionDataset:
         return cls(
             body_names=entry.body_names,
@@ -140,6 +181,8 @@ class WindowedMotionDataset(BaseDataset):
             storage_fields=entry.storage_fields,
             num_envs=num_envs,
             device=device,
+            next_window_device=next_window_device,
+            pin_window_load=pin_window_load,
         )
 
     def __del__(self) -> None:
@@ -254,7 +297,7 @@ class WindowedMotionDataset(BaseDataset):
         if hasattr(self, "_pending_loads") and self._pending_loads:
             self._drain_pending_loads(wait=True)
         self.device = torch.device(device)
-        self.next_window_device = NEXT_WINDOW_DEVICE or self.device
+        self.next_window_device = _next_window_device(self.device, self._configured_next_window_device)
         self.data = DatasetIndex(
             motion_id=self._motion_id_index_cpu.to(self.device),
             step=self._step_index_cpu.to(self.device),
@@ -264,6 +307,12 @@ class WindowedMotionDataset(BaseDataset):
         self.lengths = (self.ends - self.starts).to(self.device)
         self._pending_loads = []
         self._reset_runtime_state()
+        if (
+            self.next_window_device.type != "cpu"
+            and self._reported_next_window_device != self.next_window_device
+        ):
+            print(f"[any4hdmi][online_dataset] next_window_device={self.next_window_device}")
+            self._reported_next_window_device = self.next_window_device
         return self
 
     def _empty_motion_sample(self) -> MotionSample:
@@ -344,6 +393,8 @@ class WindowedMotionDataset(BaseDataset):
         pool_miss_motions: int = 0,
         wait_next_ready_calls: int = 0,
         wait_next_ready_wall_time_s: float = 0.0,
+        promote_envs: int = 0,
+        promote_wall_time_s: float = 0.0,
     ) -> None:
         stats = self._stats_for(profile_name)
         stats.calls += 1
@@ -357,6 +408,10 @@ class WindowedMotionDataset(BaseDataset):
         stats.pool_miss_motions += int(pool_miss_motions)
         stats.wait_next_ready_calls += int(wait_next_ready_calls)
         stats.wait_next_ready_wall_time_s += float(wait_next_ready_wall_time_s)
+        if promote_envs:
+            stats.promote_calls += 1
+            stats.promote_envs_total += int(promote_envs)
+            stats.promote_wall_time_s += float(promote_wall_time_s)
         if not self._profile_enabled:
             return
         if self._profile_focus and self._profile_focus not in profile_name:
@@ -369,6 +424,7 @@ class WindowedMotionDataset(BaseDataset):
         avg_wait_next_ready_ms = (
             1000.0 * stats.wait_next_ready_wall_time_s / max(1, stats.wait_next_ready_calls)
         )
+        avg_promote_ms = 1000.0 * stats.promote_wall_time_s / max(1, stats.promote_calls)
         print(
             "[any4hdmi][cache_profile]"
             f" profile={profile_name}"
@@ -383,6 +439,9 @@ class WindowedMotionDataset(BaseDataset):
             f" pool_miss_motions={stats.pool_miss_motions}"
             f" wait_next_ready_calls={stats.wait_next_ready_calls}"
             f" total_wait_next_ready_s={stats.wait_next_ready_wall_time_s:.4f}"
+            f" promote_calls={stats.promote_calls}"
+            f" promote_envs={stats.promote_envs_total}"
+            f" avg_promote_ms={avg_promote_ms:.2f}"
             f" avg_wait_next_ready_ms={avg_wait_next_ready_ms:.2f}"
             f" avg_background_load_ms={avg_load_ms:.2f}"
             f" avg_wait_ms={avg_wait_ms:.2f}"
@@ -449,7 +508,16 @@ class WindowedMotionDataset(BaseDataset):
         flat_index = global_index.reshape(-1)
 
         def gather_float_field(field_name: str) -> torch.Tensor:
-            field = self._storage_cpu[field_name].index_select(0, flat_index)
+            source = self._storage_cpu[field_name]
+            if self._pin_window_load and target_device.type != "cpu":
+                scratch = self._get_window_load_scratch(field_name, source, int(flat_index.numel()))
+                if scratch is not None:
+                    torch.index_select(source, 0, flat_index, out=scratch)
+                    field = scratch
+                else:
+                    field = source.index_select(0, flat_index)
+            else:
+                field = source.index_select(0, flat_index)
             field = field.reshape(batch_size, RUNTIME_MOTION_MAX_LEN, *field.shape[1:])
             if target_device.type == "cpu":
                 return field.to(dtype=float_dtype).clone()
@@ -469,6 +537,33 @@ class WindowedMotionDataset(BaseDataset):
             batch_size=(batch_size, RUNTIME_MOTION_MAX_LEN),
             device=target_device,
         )
+
+    def _get_window_load_scratch(
+        self,
+        field_name: str,
+        source: torch.Tensor,
+        flat_count: int,
+    ) -> torch.Tensor | None:
+        if self._pin_window_load_disabled:
+            return None
+        scratch = self._window_load_scratch.get(field_name)
+        shape = (flat_count, *source.shape[1:])
+        if (
+            scratch is not None
+            and scratch.shape[0] >= flat_count
+            and scratch.shape[1:] == source.shape[1:]
+            and scratch.dtype == source.dtype
+        ):
+            return scratch[:flat_count]
+        try:
+            scratch = torch.empty(shape, dtype=source.dtype, device="cpu", pin_memory=True)
+        except RuntimeError as exc:
+            print(f"[any4hdmi][online_dataset] pinned window-load scratch disabled: {exc}")
+            self._pin_window_load_disabled = True
+            self._window_load_scratch.clear()
+            return None
+        self._window_load_scratch[field_name] = scratch
+        return scratch
 
     def _load_current_windows_sync(
         self,
@@ -597,11 +692,17 @@ class WindowedMotionDataset(BaseDataset):
     def _promote_next_windows_to_current(self, env_ids: torch.Tensor) -> None:
         if env_ids.numel() == 0:
             return
+        start_time = time.perf_counter()
         next_env_ids = env_ids.to(device=self.next_window_device)
         self._index_copy_motion_data(
             self._current_window,
             env_ids,
             self._next_window[next_env_ids].to(device=self.device),
+        )
+        self._record_stats(
+            "promote",
+            promote_envs=int(env_ids.numel()),
+            promote_wall_time_s=time.perf_counter() - start_time,
         )
         self._assign_current_window_metadata(
             env_ids,
