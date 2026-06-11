@@ -1,0 +1,12 @@
+{
+  "input_root": "output/amass",
+  "output_root": "output/limmt_amass",
+  "batch_size": 256,
+  "epochs": 30,
+  "win_sec": 4.0,
+  "phase_dim": 8,
+  "downsample_rate": 5,
+  "subset_ratios": [0.04, 0.08, 0.16, 0.32],
+  "physical_pass_threshold": 90.0,
+  "gqs_alpha": 0.6
+}
