@@ -36,7 +36,7 @@ def compute_motion_qvel(model: mujoco.MjModel, qpos: np.ndarray, fps: float) -> 
     return qvel
 
 
-class MotionTensorDataset(Dataset[dict[str, Any]]):
+class MotionTensorDataset(Dataset):
     def __init__(
         self,
         *,
@@ -102,7 +102,7 @@ def move_motion_item_to_device(
     return moved
 
 
-class MotionLoaderView(Iterable[dict[str, Any]]):
+class MotionLoaderView(Iterable):
     def __init__(
         self,
         loader: DataLoader[dict[str, Any]],

@@ -5,10 +5,54 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from tensordict import TensorClass
+try:
+    from tensordict import TensorClass
+except ImportError:
+    TensorClass = None
 
 
-class MotionData(TensorClass):
+class _MotionDataFallback:
+    def __init__(
+        self,
+        *,
+        motion_id: torch.Tensor,
+        step: torch.Tensor,
+        body_pos_w: torch.Tensor,
+        body_lin_vel_w: torch.Tensor,
+        body_quat_w: torch.Tensor,
+        body_ang_vel_w: torch.Tensor,
+        joint_pos: torch.Tensor,
+        joint_vel: torch.Tensor,
+        device=None,
+        batch_size=None,
+    ):
+        self.motion_id = motion_id
+        self.step = step
+        self.body_pos_w = body_pos_w
+        self.body_lin_vel_w = body_lin_vel_w
+        self.body_quat_w = body_quat_w
+        self.body_ang_vel_w = body_ang_vel_w
+        self.joint_pos = joint_pos
+        self.joint_vel = joint_vel
+
+    @property
+    def device(self) -> torch.device:
+        return self.motion_id.device
+
+    def to(self, device: torch.device | str):
+        return type(self)(
+            motion_id=self.motion_id.to(device),
+            step=self.step.to(device),
+            body_pos_w=self.body_pos_w.to(device),
+            body_lin_vel_w=self.body_lin_vel_w.to(device),
+            body_quat_w=self.body_quat_w.to(device),
+            body_ang_vel_w=self.body_ang_vel_w.to(device),
+            joint_pos=self.joint_pos.to(device),
+            joint_vel=self.joint_vel.to(device),
+        )
+
+
+class MotionData(TensorClass if TensorClass is not None else _MotionDataFallback):
     motion_id: torch.Tensor
     step: torch.Tensor
     body_pos_w: torch.Tensor

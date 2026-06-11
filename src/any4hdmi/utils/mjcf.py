@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Union
 
 import mujoco
 
@@ -14,7 +15,7 @@ DEFAULT_BASE_JOINT_NAME = "floating_base_joint"
 DEFAULT_MJCF_REPO_ID = "elijahgalahad/g1_xmls"
 DEFAULT_MJCF_PATH = "g1-mode_13_15.xml"
 DEFAULT_MJCF_REVISION = "main"
-MjcfInput = str | Path
+MjcfInput = Union[str, Path]
 
 
 def build_hf_mjcf_reference(

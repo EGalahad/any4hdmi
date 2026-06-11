@@ -13,7 +13,10 @@ from typing import Any
 
 import numpy as np
 import torch
-from tensordict import MemoryMappedTensor
+try:
+    from tensordict import MemoryMappedTensor
+except ImportError:
+    MemoryMappedTensor = None
 from tqdm import tqdm
 
 from any4hdmi.core.model import body_names_from_model, hinge_joint_info, load_model
@@ -264,18 +267,25 @@ class _GrowableMotionStorage:
         for field_name, (dtype, _) in self.specs.items():
             field_path = self._field_path(field_name)
             field_shape = self._field_shape(field_name, capacity)
-            if field_path.exists():
-                fields[field_name] = MemoryMappedTensor.from_filename(
-                    str(field_path),
-                    dtype=dtype,
-                    shape=field_shape,
-                )
+            if MemoryMappedTensor is not None:
+                if field_path.exists():
+                    fields[field_name] = MemoryMappedTensor.from_filename(
+                        str(field_path),
+                        dtype=dtype,
+                        shape=field_shape,
+                    )
+                else:
+                    fields[field_name] = MemoryMappedTensor.empty(
+                        field_shape,
+                        dtype=dtype,
+                        filename=str(field_path),
+                    )
             else:
-                fields[field_name] = MemoryMappedTensor.empty(
-                    field_shape,
-                    dtype=dtype,
-                    filename=str(field_path),
-                )
+                numel = int(np.prod(field_shape))
+                if not field_path.exists():
+                    field_path.parent.mkdir(parents=True, exist_ok=True)
+                    field_path.truncate(numel * torch.empty((), dtype=dtype).element_size())
+                fields[field_name] = torch.from_file(str(field_path), shared=True, size=numel, dtype=dtype).view(field_shape)
         return fields
 
     def ensure_capacity(self, required_length: int) -> None:
@@ -797,11 +807,19 @@ class FKCache:
         specs = _storage_field_specs(body_count=body_count, joint_count=joint_count)
         storage_fields: dict[str, torch.Tensor] = {}
         for field_name, (dtype, tail_shape) in specs.items():
-            storage_fields[field_name] = MemoryMappedTensor.from_filename(
-                str(self.cache_entry_dir / QPOS_CACHE_TD_SUBDIR / f"{field_name}.memmap"),
-                dtype=dtype,
-                shape=(allocated_capacity, *tail_shape),
-            )[:total_length]
+            field_shape = (allocated_capacity, *tail_shape)
+            field_path = self.cache_entry_dir / QPOS_CACHE_TD_SUBDIR / f"{field_name}.memmap"
+            if MemoryMappedTensor is not None:
+                storage_fields[field_name] = MemoryMappedTensor.from_filename(
+                    str(field_path),
+                    dtype=dtype,
+                    shape=field_shape,
+                )[:total_length]
+            else:
+                numel = int(np.prod(field_shape))
+                storage_fields[field_name] = torch.from_file(
+                    str(field_path), shared=True, size=numel, dtype=dtype
+                ).view(field_shape)[:total_length]
 
         resolved_motion_paths = motion_paths
         if resolved_motion_paths is None:
