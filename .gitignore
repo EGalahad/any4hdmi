@@ -2,6 +2,8 @@ output/
 .vscode
 stubs
 .codex
+.omx/
+real_pico
 
 
 # Byte-compiled / optimized / DLL files

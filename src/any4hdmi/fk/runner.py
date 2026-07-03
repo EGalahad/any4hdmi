@@ -18,12 +18,15 @@ class FKRunner:
         mjcf_path: Path,
         batch_size: int,
         device: str | torch.device | None = None,
+        *,
+        contact_nconmax: int | None = None,
     ) -> None:
         self.model = mujoco.MjModel.from_xml_path(str(mjcf_path))
         self.data = mujoco.MjData(self.model)
         self.body_names = body_names_from_model(self.model)
         self.joint_names, joint_qpos_addrs, joint_dof_addrs = hinge_joint_info(self.model)
         self.batch_size = max(1, int(batch_size))
+        self.contact_nconmax = int(contact_nconmax) if contact_nconmax is not None else None
         self.backend = "mujoco"
         self.device = torch.device("cpu")
         self._wp = None
@@ -93,7 +96,7 @@ class FKRunner:
             self._wp = wp
             self._mjw = mjw
             self._warp_model = mjw.put_model(self.model)
-            self._warp_data = mjw.make_data(self.model, nworld=self.batch_size)
+            self._warp_data = mjw.make_data(self.model, nworld=self.batch_size, nconmax=self.contact_nconmax)
             self.device = torch.device(str(self._warp_data.qpos.device))
             self._padded_qpos = torch.zeros(
                 (self.batch_size, self.model.nq),
@@ -279,6 +282,152 @@ class FKRunner:
             self._wp.synchronize()
         return self._wp.to_torch(self._warp_data.xpos)[:nworld].clone()
 
+    def _empty_contact_summary(self, frames: int, *, device: torch.device | None = None) -> dict[str, torch.Tensor]:
+        target = self.device if device is None else device
+        return {
+            "floor_min_dist": torch.full((frames,), 100.0, dtype=torch.float32, device=target),
+            "non_floor_contact_count": torch.zeros((frames,), dtype=torch.float32, device=target),
+            "contact_buffer_saturated": torch.zeros((frames,), dtype=torch.bool, device=target),
+        }
+
+    def _forward_contact_summary_cpu(
+        self,
+        qpos: torch.Tensor,
+        qvel: torch.Tensor,
+        *,
+        floor_geom_id: int,
+    ) -> dict[str, torch.Tensor]:
+        orig_device = qpos.device
+        qpos_cpu = qpos.to(device="cpu", dtype=torch.float32).contiguous()
+        qvel_cpu = qvel.to(device="cpu", dtype=torch.float32).contiguous()
+        qpos_np = qpos_cpu.numpy()
+        qvel_np = qvel_cpu.numpy()
+        frames = int(qpos_cpu.shape[0])
+
+        floor_min_dist = torch.full((frames,), 100.0, dtype=torch.float32)
+        non_floor_contact_count = torch.zeros((frames,), dtype=torch.float32)
+        contact_buffer_saturated = torch.zeros((frames,), dtype=torch.bool)
+        model_nconmax = int(getattr(self.model, "nconmax", 0) or 0)
+
+        for frame_idx, (qpos_frame, qvel_frame) in enumerate(zip(qpos_np, qvel_np, strict=True)):
+            self.data.qpos[:] = qpos_frame
+            self.data.qvel[:] = qvel_frame
+            mujoco.mj_forward(self.model, self.data)
+
+            if model_nconmax > 0 and int(self.data.ncon) >= model_nconmax:
+                contact_buffer_saturated[frame_idx] = True
+
+            min_dist = 100.0
+            non_floor_count = 0
+            for contact_idx in range(int(self.data.ncon)):
+                contact = self.data.contact[contact_idx]
+                geom0 = int(contact.geom[0])
+                geom1 = int(contact.geom[1])
+                has_floor = geom0 == floor_geom_id or geom1 == floor_geom_id
+                if has_floor:
+                    min_dist = min(min_dist, float(contact.dist))
+                elif float(contact.dist) < 0.0:
+                    non_floor_count += 1
+            floor_min_dist[frame_idx] = min_dist
+            non_floor_contact_count[frame_idx] = float(non_floor_count)
+
+        return {
+            "floor_min_dist": floor_min_dist.to(device=orig_device),
+            "non_floor_contact_count": non_floor_contact_count.to(device=orig_device),
+            "contact_buffer_saturated": contact_buffer_saturated.to(device=orig_device),
+        }
+
+    def _clear_warp_contacts(self) -> None:
+        assert self._wp is not None
+        assert self._warp_data is not None
+        contact = self._warp_data.contact
+        self._wp.to_torch(contact.geom).fill_(-1)
+        self._wp.to_torch(contact.worldid).fill_(-1)
+        self._wp.to_torch(contact.dim).zero_()
+        self._wp.to_torch(contact.dist).fill_(100.0)
+
+    def _forward_contact_summary_warp(
+        self,
+        qpos: torch.Tensor,
+        qvel: torch.Tensor,
+        *,
+        floor_geom_id: int,
+        synchronize: bool,
+    ) -> dict[str, torch.Tensor]:
+        assert self._mjw is not None
+        assert self._wp is not None
+        assert self._warp_model is not None
+        assert self._warp_data is not None
+
+        qpos = self.to_device(qpos, name="qpos")
+        qvel = self.to_device(qvel, name="qvel")
+        nworld = int(qpos.shape[0])
+        if nworld > self.batch_size:
+            raise ValueError(f"Chunk size {nworld} exceeds batch_size {self.batch_size}")
+
+        qpos_work = qpos
+        qvel_work = qvel
+        if nworld < self.batch_size:
+            assert self._padded_qpos is not None
+            assert self._padded_qvel is not None
+            self._padded_qpos[:nworld] = qpos
+            self._padded_qvel[:nworld] = qvel
+            self._padded_qpos[nworld:].zero_()
+            self._padded_qvel[nworld:].zero_()
+            qpos_work = self._padded_qpos
+            qvel_work = self._padded_qvel
+
+        self._wp.copy(self._warp_data.qpos, self._wp.from_torch(qpos_work))
+        self._wp.copy(self._warp_data.qvel, self._wp.from_torch(qvel_work))
+        self._mjw.fwd_position(self._warp_model, self._warp_data)
+        self._clear_warp_contacts()
+        self._mjw.collision(self._warp_model, self._warp_data)
+        if synchronize and hasattr(self._wp, "synchronize"):
+            self._wp.synchronize()
+
+        contact = self._warp_data.contact
+        geom = self._wp.to_torch(contact.geom)
+        dist = self._wp.to_torch(contact.dist).to(dtype=torch.float32)
+        worldid = self._wp.to_torch(contact.worldid).to(dtype=torch.long)
+        dim = self._wp.to_torch(contact.dim)
+
+        active = (
+            (worldid >= 0)
+            & (worldid < nworld)
+            & (dim > 0)
+            & (geom[:, 0] >= 0)
+            & (geom[:, 1] >= 0)
+        )
+        has_floor = (geom[:, 0] == int(floor_geom_id)) | (geom[:, 1] == int(floor_geom_id))
+        floor_active = active & has_floor
+        non_floor_active = active & (~has_floor) & (dist < 0.0)
+
+        summary = self._empty_contact_summary(nworld)
+        if floor_active.any():
+            summary["floor_min_dist"].scatter_reduce_(
+                0,
+                worldid[floor_active],
+                dist[floor_active],
+                reduce="amin",
+                include_self=True,
+            )
+        if non_floor_active.any():
+            summary["non_floor_contact_count"].scatter_add_(
+                0,
+                worldid[non_floor_active],
+                torch.ones_like(dist[non_floor_active], dtype=torch.float32),
+            )
+        if self.contact_nconmax is not None:
+            active_count = torch.zeros((nworld,), dtype=torch.float32, device=self.device)
+            if active.any():
+                active_count.scatter_add_(
+                    0,
+                    worldid[active],
+                    torch.ones_like(dist[active], dtype=torch.float32),
+                )
+            summary["contact_buffer_saturated"] = active_count >= float(self.contact_nconmax)
+        return summary
+
     def forward_positions(self, qpos: torch.Tensor) -> torch.Tensor:
         normalized_qpos = self.to_device(qpos, name="qpos")
         if normalized_qpos.shape[0] == 0:
@@ -339,6 +488,52 @@ class FKRunner:
                 self._forward_kinematics_warp(
                     normalized_qpos[start:stop],
                     normalized_qvel[start:stop],
+                    synchronize=synchronize and stop >= normalized_qpos.shape[0],
+                )
+            )
+
+        return {
+            key: torch.cat([chunk[key] for chunk in chunk_outputs], dim=0)
+            for key in chunk_outputs[0]
+        }
+
+    def forward_contact_summary(
+        self,
+        qpos: torch.Tensor,
+        qvel: torch.Tensor,
+        *,
+        floor_geom_id: int,
+        synchronize: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        normalized_qpos = self.to_device(qpos, name="qpos")
+        normalized_qvel = self.to_device(qvel, name="qvel")
+        if normalized_qpos.shape != (normalized_qpos.shape[0], self.model.nq):
+            raise ValueError(f"Expected qpos shape [batch, {self.model.nq}], got {tuple(normalized_qpos.shape)}")
+        if normalized_qvel.shape != (normalized_qvel.shape[0], self.model.nv):
+            raise ValueError(f"Expected qvel shape [batch, {self.model.nv}], got {tuple(normalized_qvel.shape)}")
+        if normalized_qpos.shape[0] != normalized_qvel.shape[0]:
+            raise ValueError(
+                f"Expected qpos/qvel to share batch dimension, got {normalized_qpos.shape[0]} and {normalized_qvel.shape[0]}"
+            )
+        if normalized_qpos.shape[0] == 0:
+            return self._empty_contact_summary(0)
+        if self._fake_zero_outputs:
+            return self._empty_contact_summary(int(normalized_qpos.shape[0]))
+        if self.backend != "mujoco_warp":
+            return self._forward_contact_summary_cpu(
+                normalized_qpos,
+                normalized_qvel,
+                floor_geom_id=int(floor_geom_id),
+            )
+
+        chunk_outputs: list[dict[str, torch.Tensor]] = []
+        for start in range(0, normalized_qpos.shape[0], self.batch_size):
+            stop = min(normalized_qpos.shape[0], start + self.batch_size)
+            chunk_outputs.append(
+                self._forward_contact_summary_warp(
+                    normalized_qpos[start:stop],
+                    normalized_qvel[start:stop],
+                    floor_geom_id=int(floor_geom_id),
                     synchronize=synchronize and stop >= normalized_qpos.shape[0],
                 )
             )

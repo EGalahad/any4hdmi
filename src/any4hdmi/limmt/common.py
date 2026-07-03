@@ -9,15 +9,37 @@ from any4hdmi.core.format import MOTIONS_SUBDIR, load_manifest, write_manifest
 from any4hdmi.dataset.loading import resolve_input_paths
 
 
-DEFAULT_INPUT_ROOT = Path("output/amass")
-DEFAULT_OUTPUT_ROOT = Path("output/limmt_amass")
-DEFAULT_PASS_DATASET_NAME = "amass_limmt_pass"
-DEFAULT_RATIOS = (0.04, 0.08, 0.16, 0.32)
-
-
 def resolve_dataset_root(path: str | Path, *, base_dir: Path | None = None) -> Path:
     base = Path.cwd() if base_dir is None else base_dir
     return resolve_input_paths(base, path)[0]
+
+
+def resolve_project_root(path: str | Path, *, base_dir: Path | None = None) -> Path:
+    base = Path.cwd() if base_dir is None else base_dir
+    project_path = Path(path).expanduser()
+    if not project_path.is_absolute():
+        project_path = base / project_path
+    return project_path.resolve()
+
+
+def default_project_root_for_input(input_root: Path) -> Path:
+    return input_root.parent / f"{input_root.name}_limmt"
+
+
+def project_pass_root(project_root: Path, pass_dataset_name: str = "passed") -> Path:
+    return project_root / pass_dataset_name
+
+
+def project_hme_root(project_root: Path, hme_folder: str = "hme") -> Path:
+    return project_root / hme_folder
+
+
+def project_embeddings_root(project_root: Path, embeddings_folder: str = "embeddings") -> Path:
+    return project_root / embeddings_folder
+
+
+def project_subsets_root(project_root: Path, subsets_folder: str = "subsets") -> Path:
+    return project_root / subsets_folder
 
 
 def motion_paths_for_root(dataset_root: Path) -> list[Path]:
@@ -37,10 +59,10 @@ def read_json(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def write_json(path: str | Path, payload: Any) -> Path:
+def write_json(path: str | Path, json_payload: Any) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(json_payload, indent=2) + "\n", encoding="utf-8")
     return path
 
 
@@ -69,8 +91,8 @@ def copy_any4hdmi_subset(
         try:
             import numpy as np
 
-            with np.load(src, allow_pickle=False) as data:
-                total_frames += int(data["qpos"].shape[0])
+            with np.load(src, allow_pickle=False) as motion_file:
+                total_frames += int(motion_file["qpos"].shape[0])
         except Exception:
             pass
 

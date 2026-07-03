@@ -19,6 +19,7 @@ dependencies = [
     "tensordict",
     "torch",
     "tqdm",
+    "tyro",
     "viser",
 ]
 
@@ -36,7 +37,7 @@ any4hdmi-convert-axellwppr = "any4hdmi.scripts.preprocess.axellwppr:main"
 any4hdmi-filter-dataset = "any4hdmi.scripts.filter:main"
 any4hdmi-upload = "any4hdmi.scripts.upload:main"
 any4hdmi-limmt-score = "any4hdmi.limmt.physical_filter:main"
-any4hdmi-limmt-train-hme = "any4hdmi.limmt.train_hme:main"
+any4hdmi-limmt-train-hme = "any4hdmi.limmt.hme.train:main"
 any4hdmi-limmt-embed = "any4hdmi.limmt.embed:main"
 any4hdmi-limmt-visualize = "any4hdmi.limmt.visualize:main"
 any4hdmi-limmt-gqs = "any4hdmi.limmt.gqs:main"

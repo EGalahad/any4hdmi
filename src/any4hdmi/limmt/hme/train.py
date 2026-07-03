@@ -1,65 +1,73 @@
 from __future__ import annotations
 
-import argparse
 import json
 import os
-from pathlib import Path
+from dataclasses import dataclass
+from typing import Literal
 
 import torch
+import tyro
 from torch import distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
-from any4hdmi.limmt.common import DEFAULT_OUTPUT_ROOT, resolve_dataset_root, write_json
-from any4hdmi.limmt.hme import (
+from any4hdmi.limmt.common import project_hme_root, project_pass_root, resolve_project_root, write_json
+from any4hdmi.limmt.hme.features import HME_FEATURE_TYPE
+from any4hdmi.limmt.hme.loading import (
     CachedHmeWindowDataset,
-    HME_FEATURE_TYPE,
-    PeriodicAutoencoder,
     build_hme_feature_cache,
+    hme_feature_cache_is_current,
     wait_for_hme_feature_cache,
 )
+from any4hdmi.limmt.hme.model import PeriodicAutoencoder
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train LIMMT HME/PeriodicAutoencoder on an any4hdmi dataset.")
-    parser.add_argument("--input-root", default=str(DEFAULT_OUTPUT_ROOT / "amass_limmt_pass"))
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_ROOT / "hme"))
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--win-sec", type=float, default=4.0)
-    parser.add_argument("--phase-dim", type=int, default=8)
-    parser.add_argument("--hidden-dims", type=int, nargs="+", default=[64, 64])
-    parser.add_argument("--downsample-rate", type=int, default=5)
-    parser.add_argument("--stride", type=int, default=1)
-    parser.add_argument("--cache-dir", default=None, help="Feature cache directory. Defaults to <output-dir>/feature_cache.")
-    parser.add_argument("--rebuild-cache", action="store_true", help="Rebuild cached joint_pos/joint_vel/root_pose/root_vel features before training.")
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--scheduler", choices=("none", "cosine", "onecycle"), default="none")
-    parser.add_argument("--max-lr", type=float, default=None, help="Peak LR for onecycle. Defaults to --lr.")
-    parser.add_argument("--min-lr", type=float, default=1e-5, help="Final LR for cosine.")
-    parser.add_argument("--onecycle-pct-start", type=float, default=0.15)
-    parser.add_argument("--onecycle-div-factor", type=float, default=10.0)
-    parser.add_argument("--onecycle-final-div-factor", type=float, default=100.0)
-    parser.add_argument("--num-workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
-    parser.add_argument("--device", default=None)
-    return parser.parse_args()
+@dataclass(frozen=True)
+class TrainHmeArgs:
+    """Train LIMMT HME/PeriodicAutoencoder on an any4hdmi dataset."""
+
+    project_path: str
+    pass_dataset_name: str = "passed"
+    hme_folder: str = "hme"
+    batch_size: int = 256
+    epochs: int = 30
+    win_sec: float = 4.0
+    phase_dim: int = 8
+    hidden_dims: tuple[int, ...] = (64, 64)
+    downsample_rate: int = 5
+    stride: int = 1
+    rebuild_cache: bool = False
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    scheduler: Literal["none", "cosine", "onecycle"] = "none"
+    max_lr: float | None = None
+    min_lr: float = 1e-5
+    onecycle_pct_start: float = 0.15
+    onecycle_div_factor: float = 10.0
+    onecycle_final_div_factor: float = 100.0
+    num_workers: int = max(1, (os.cpu_count() or 2) // 2)
+    device: str | None = None
 
 
 def _ddp_state() -> tuple[bool, int, int, int]:
     if "RANK" not in os.environ:
         return False, 0, 0, 1
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    return True, rank, local_rank, world_size
+
+
+def _init_ddp(local_rank: int) -> None:
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
         dist.init_process_group(backend="nccl", device_id=device)
     else:
         dist.init_process_group(backend="gloo")
-    return True, int(os.environ["RANK"]), local_rank, dist.get_world_size()
 
 
-def _build_scheduler(args: argparse.Namespace, optimizer: torch.optim.Optimizer, *, steps_per_epoch: int):
+def _build_scheduler(args: TrainHmeArgs, optimizer: torch.optim.Optimizer, *, steps_per_epoch: int):
     total_steps = max(1, int(args.epochs) * max(1, int(steps_per_epoch)))
     if args.scheduler == "none":
         return None
@@ -82,24 +90,27 @@ def _build_scheduler(args: argparse.Namespace, optimizer: torch.optim.Optimizer,
 
 
 def main() -> None:
-    args = _parse_args()
+    args = tyro.cli(TrainHmeArgs)
     is_ddp, rank, local_rank, world_size = _ddp_state()
-    output_dir = Path(args.output_dir).expanduser().resolve()
+    project_root = resolve_project_root(args.project_path)
+    input_root = project_pass_root(project_root, args.pass_dataset_name)
+    output_dir = project_hme_root(project_root, args.hme_folder)
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(args.device or (f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"))
-    if device.type == "cuda":
-        torch.cuda.set_device(device)
-
-    input_root = resolve_dataset_root(args.input_root)
-    cache_dir = Path(args.cache_dir).expanduser().resolve() if args.cache_dir else output_dir / "feature_cache"
+    cache_dir = output_dir / "feature_cache"
     if rank == 0:
         if args.rebuild_cache and cache_dir.exists():
             import shutil
 
             shutil.rmtree(cache_dir)
-        if args.rebuild_cache or not (cache_dir / "index.json").is_file():
+        if args.rebuild_cache or not hme_feature_cache_is_current(
+            cache_dir,
+            dataset_root=input_root,
+            win_sec=args.win_sec,
+            downsample_rate=args.downsample_rate,
+            stride=args.stride,
+        ):
             build_hme_feature_cache(
                 dataset_root=input_root,
                 cache_dir=cache_dir,
@@ -107,12 +118,17 @@ def main() -> None:
                 downsample_rate=args.downsample_rate,
                 stride=args.stride,
             )
-    if is_ddp:
-        dist.barrier()
-    else:
-        wait_for_hme_feature_cache(cache_dir)
     if rank != 0:
         wait_for_hme_feature_cache(cache_dir)
+    else:
+        wait_for_hme_feature_cache(cache_dir)
+
+    if is_ddp:
+        _init_ddp(local_rank)
+
+    device = torch.device(args.device or (f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"))
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     dataset = CachedHmeWindowDataset(cache_dir)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False) if is_ddp else None
     loader = DataLoader(
@@ -124,9 +140,9 @@ def main() -> None:
         pin_memory=device.type == "cuda",
         drop_last=True,
     )
-    sample = dataset[0]
+    sample_window = dataset[0]
     model = PeriodicAutoencoder(
-        inp_ch=int(sample.shape[-1]),
+        inp_ch=int(sample_window.shape[-1]),
         latent_ch=args.phase_dim,
         win_len=dataset.win_len,
         hidden_dims=tuple(int(dim) for dim in args.hidden_dims),
@@ -142,9 +158,11 @@ def main() -> None:
             output_dir / "train_config.json",
             {
                 **vars(args),
+                "project_root": str(project_root),
                 "input_root": str(input_root),
+                "output_dir": str(output_dir),
                 "cache_dir": str(cache_dir),
-                "state_dim": int(sample.shape[-1]),
+                "state_dim": int(sample_window.shape[-1]),
                 "feature_type": HME_FEATURE_TYPE,
                 "win_len": int(dataset.win_len),
                 "num_windows": len(dataset),
@@ -161,26 +179,26 @@ def main() -> None:
         if sampler is not None:
             sampler.set_epoch(epoch)
         train_model.train()
-        total = 0.0
-        count = 0
+        loss_total = 0.0
+        batch_count = 0
         for batch in loader:
-            inp = batch.permute(0, 2, 1).to(device=device, dtype=torch.float32, non_blocking=True)
-            out = train_model(inp)
-            loss = out["loss"]
+            input_windows = batch.permute(0, 2, 1).to(device=device, dtype=torch.float32, non_blocking=True)
+            model_output = train_model(input_windows)
+            loss = model_output["loss"]
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(train_model.parameters(), 10.0)
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
-            total += float(loss.detach().item())
-            count += 1
+            loss_total += float(loss.detach().item())
+            batch_count += 1
         if is_ddp:
-            loss_stats = torch.tensor([total, float(count)], device=device, dtype=torch.float64)
+            loss_stats = torch.tensor([loss_total, float(batch_count)], device=device, dtype=torch.float64)
             dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
             avg_loss = float((loss_stats[0] / loss_stats[1].clamp_min(1.0)).item())
         else:
-            avg_loss = total / max(count, 1)
+            avg_loss = loss_total / max(batch_count, 1)
         if rank == 0:
             lr_now = float(optimizer.param_groups[0]["lr"])
             losses.append({"epoch": epoch, "loss": avg_loss, "lr": lr_now})
@@ -188,7 +206,7 @@ def main() -> None:
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
-                    "state_dim": int(sample.shape[-1]),
+                    "state_dim": int(sample_window.shape[-1]),
                     "feature_type": HME_FEATURE_TYPE,
                     "phase_dim": args.phase_dim,
                     "hidden_dims": [int(dim) for dim in args.hidden_dims],

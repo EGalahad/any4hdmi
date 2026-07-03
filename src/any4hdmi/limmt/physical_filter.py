@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import argparse
-import csv
 import json
 import os
 import shutil
@@ -11,24 +9,33 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import mujoco
 import numpy as np
 import torch
+import tyro
+from mjhub import temp_mjcf_with_floor
 from tqdm import tqdm
 
 from any4hdmi.core.format import ensure_dir, load_manifest, load_motion, write_manifest
 from any4hdmi.fk.runner import FKRunner
-from any4hdmi.limmt.common import DEFAULT_INPUT_ROOT, DEFAULT_OUTPUT_ROOT, relative_motion_path, resolve_dataset_root, write_json
+from any4hdmi.limmt.common import (
+    default_project_root_for_input,
+    project_pass_root,
+    resolve_dataset_root,
+    resolve_project_root,
+    write_json,
+)
 from any4hdmi.utils.dataset import build_motion_loader
 
 
 @dataclass(frozen=True)
 class PhysicalScoreWeights:
-    foot_sliding: float = 8.0
-    velocity_violation: float = 10.0
-    self_collision: float = 5.0
-    jerk: float = 0.02
-    penetration: float = 20.0
-    floating_frames_ratio: float = 25.0
+    foot_sliding: float = 1.70
+    velocity_violation: float = 44.22
+    self_collision: float = 0.17
+    jerk: float = 0.28
+    penetration: float = 216.62
+    floating_frames_ratio: float = 24.19
 
 
 @dataclass(frozen=True)
@@ -36,129 +43,158 @@ class PhysicalFilterConfig:
     pass_threshold: float = 90.0
     batch_frames: int = 131072
     fk_batch_size: int = 8192
-    max_root_qvel: float = 10.0
     max_joint_vel: float = 30.0
-    max_body_lin_vel: float = 20.0
-    max_body_ang_vel: float = 40.0
-    foot_height: float = 0.08
-    foot_slide_speed: float = 0.15
-    floating_height: float = 0.20
-    penetration_height: float = -0.02
-    self_collision_distance: float = 0.045
-    contact_sample_stride: int = 5
+    foot_height: float = 0.05
+    foot_slide_speed: float = 0.10
+    foot_slide_multiplier: float = 5.0
+    floating_distance: float = 0.05
+    floating_window_sec: float = 1.0
+    penetration_margin: float = 0.01
+    self_collision_count_clip: float = 10.0
+    contact_nconmax: int = 128
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run LIMMT physical quality filtering on an any4hdmi dataset.")
-    parser.add_argument("--input-root", default=str(DEFAULT_INPUT_ROOT))
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_ROOT))
-    parser.add_argument("--pass-dataset-name", default="amass_limmt_pass")
-    parser.add_argument("--pass-threshold", type=float, default=90.0)
-    parser.add_argument("--batch-frames", type=int, default=131072)
-    parser.add_argument("--fk-batch-size", type=int, default=8192)
-    parser.add_argument(
-        "--device",
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Preferred FK device. cuda uses MuJoCo Warp when the optional warp extra is installed; otherwise FKRunner falls back to CPU MuJoCo.",
+@dataclass(frozen=True)
+class PhysicalFilterArgs:
+    """Run LIMMT physical quality filtering on an any4hdmi dataset."""
+
+    input_path: str
+    project_path: str | None = None
+    pass_dataset_name: str = "passed"
+    pass_threshold: float = 90.0
+    batch_frames: int = 131072
+    fk_batch_size: int = 8192
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    num_workers: int = max(1, min(16, (os.cpu_count() or 2) - 1))
+    prefetch_factor: int = 4
+    contact_nconmax: int = 128
+    limit: int | None = None
+
+
+G1_JOINT_VELOCITY_LIMITS = {
+    "left_hip_pitch_joint": 32.0,
+    "right_hip_pitch_joint": 32.0,
+    "waist_yaw_joint": 32.0,
+    "left_hip_roll_joint": 32.0,
+    "right_hip_roll_joint": 32.0,
+    "left_hip_yaw_joint": 32.0,
+    "right_hip_yaw_joint": 32.0,
+    "left_knee_joint": 20.0,
+    "right_knee_joint": 20.0,
+    "left_shoulder_pitch_joint": 37.0,
+    "right_shoulder_pitch_joint": 37.0,
+    "left_ankle_pitch_joint": 37.0,
+    "right_ankle_pitch_joint": 37.0,
+    "left_shoulder_roll_joint": 37.0,
+    "right_shoulder_roll_joint": 37.0,
+    "left_ankle_roll_joint": 37.0,
+    "right_ankle_roll_joint": 37.0,
+    "left_shoulder_yaw_joint": 37.0,
+    "right_shoulder_yaw_joint": 37.0,
+    "left_elbow_joint": 37.0,
+    "right_elbow_joint": 37.0,
+    "left_wrist_roll_joint": 37.0,
+    "right_wrist_roll_joint": 37.0,
+    "left_wrist_pitch_joint": 22.0,
+    "right_wrist_pitch_joint": 22.0,
+    "left_wrist_yaw_joint": 22.0,
+    "right_wrist_yaw_joint": 22.0,
+}
+
+
+def _resolve_floor_geom_id(model: mujoco.MjModel) -> tuple[int, str]:
+    floor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    if floor_id >= 0:
+        return int(floor_id), "floor"
+    for geom_id in range(model.ngeom):
+        if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_PLANE:
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or f"geom_{geom_id}"
+            return int(geom_id), name
+    raise ValueError("No floor geom named 'floor' or plane geom found in scoring MJCF")
+
+
+def _body_id_by_name(model: mujoco.MjModel, name: str) -> int | None:
+    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+    return int(body_id) if body_id >= 0 else None
+
+
+def _joint_velocity_limits(joint_names: list[str], *, default: float, device: torch.device) -> torch.Tensor:
+    limits = [float(G1_JOINT_VELOCITY_LIMITS.get(joint_name, default)) for joint_name in joint_names]
+    return torch.as_tensor(limits, dtype=torch.float32, device=device)
+
+
+def _official_foot_sliding(
+    *,
+    body_pos: torch.Tensor,
+    body_lin: torch.Tensor,
+    foot_body_ids: tuple[int, int],
+    config: PhysicalFilterConfig,
+) -> float:
+    left_id, right_id = foot_body_ids
+    left_speed = torch.linalg.vector_norm(body_lin[:, left_id, :2], dim=-1)
+    right_speed = torch.linalg.vector_norm(body_lin[:, right_id, :2], dim=-1)
+    left_contact = body_pos[:, left_id, 2] < config.foot_height
+    right_contact = body_pos[:, right_id, 2] < config.foot_height
+    p_slide = torch.where(left_contact, torch.relu(left_speed - config.foot_slide_speed), left_speed.new_zeros(()))
+    p_slide = p_slide + torch.where(
+        right_contact,
+        torch.relu(right_speed - config.foot_slide_speed),
+        right_speed.new_zeros(()),
     )
-    parser.add_argument("--num-workers", type=int, default=max(1, min(16, (os.cpu_count() or 2) - 1)))
-    parser.add_argument("--prefetch-factor", type=int, default=4)
-    parser.add_argument("--contact-sample-stride", type=int, default=5)
-    parser.add_argument("--limit", type=int, default=None, help="Optional debug limit on number of motions.")
-    return parser.parse_args()
+    return float((p_slide * float(config.foot_slide_multiplier)).mean().item())
 
 
-def _body_indices(names: list[str], tokens: tuple[str, ...]) -> list[int]:
-    out = []
-    for idx, name in enumerate(names):
-        lowered = (name or "").lower()
-        if any(token in lowered for token in tokens):
-            out.append(idx)
-    return out
-
-
-def _self_collision_pairs(body_names: list[str], body_count: int) -> tuple[torch.Tensor, torch.Tensor]:
-    skip_tokens = ("world", "pelvis", "torso", "logo", "head")
-    candidate = [
-        idx
-        for idx, name in enumerate(body_names)
-        if idx > 0 and not any(token in (name or "").lower() for token in skip_tokens)
-    ]
-    left: list[int] = []
-    right: list[int] = []
-    for offset, a in enumerate(candidate):
-        side_a = "left" if "left" in (body_names[a] or "").lower() else "right" if "right" in (body_names[a] or "").lower() else ""
-        for b in candidate[offset + 1 :]:
-            name_b = (body_names[b] or "").lower()
-            side_b = "left" if "left" in name_b else "right" if "right" in name_b else ""
-            if side_a and side_a == side_b:
-                continue
-            left.append(a)
-            right.append(b)
-    if not left:
-        return torch.empty((0,), dtype=torch.long), torch.empty((0,), dtype=torch.long)
-    return torch.as_tensor(left, dtype=torch.long), torch.as_tensor(right, dtype=torch.long)
-
-
-def _safe_mean_positive(values: torch.Tensor) -> float:
-    if values.numel() == 0:
+def _sustained_air_ratio(floor_min_dist: torch.Tensor, *, fps: float, config: PhysicalFilterConfig) -> float:
+    valid_air = (floor_min_dist.detach().to(device="cpu", dtype=torch.float32).numpy() > float(config.floating_distance)).astype(np.float32)
+    if valid_air.size == 0:
         return 0.0
-    return float(values.to(dtype=torch.float32).mean().item())
+    window_size = max(1, int(float(config.floating_window_sec) * float(fps)))
+    if window_size <= 1:
+        return float(valid_air.mean())
+    conv = np.convolve(valid_air, np.ones(window_size, dtype=np.float32), mode="same")
+    return float(np.mean(conv >= (float(window_size) - 0.1)))
 
 
 def _score_motion(
     *,
     rel_motion: str,
-    outputs: dict[str, torch.Tensor],
+    fk_results: dict[str, torch.Tensor],
     qvel: torch.Tensor,
     fps: float,
     config: PhysicalFilterConfig,
     weights: PhysicalScoreWeights,
-    foot_indices: torch.Tensor,
-    pair_left: torch.Tensor,
-    pair_right: torch.Tensor,
+    contact_summary: dict[str, torch.Tensor],
+    foot_body_ids: tuple[int, int],
+    joint_vel_limits: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     frames = int(qvel.shape[0])
-    body_pos = outputs["body_pos_w"]
-    body_lin = outputs["body_lin_vel_w"]
-    body_ang = outputs["body_ang_vel_w"]
-    joint_vel = outputs["joint_vel"]
+    body_pos = fk_results["body_pos_w"]
+    body_lin = fk_results["body_lin_vel_w"]
+    joint_vel = fk_results["joint_vel"]
 
-    if foot_indices.numel() > 0:
-        foot_pos = body_pos.index_select(1, foot_indices.to(body_pos.device))
-        foot_vel = body_lin.index_select(1, foot_indices.to(body_lin.device))
-        near_ground = foot_pos[..., 2] < config.foot_height
-        slide_speed = torch.linalg.vector_norm(foot_vel[..., :2], dim=-1)
-        foot_sliding = _safe_mean_positive(torch.relu(slide_speed - config.foot_slide_speed) * near_ground)
+    foot_sliding = _official_foot_sliding(body_pos=body_pos, body_lin=body_lin, foot_body_ids=foot_body_ids, config=config)
+
+    if joint_vel.numel():
+        if joint_vel_limits is None:
+            joint_vel_limits = torch.full((joint_vel.shape[1],), float(config.max_joint_vel), dtype=torch.float32, device=joint_vel.device)
+        else:
+            joint_vel_limits = joint_vel_limits.to(device=joint_vel.device, dtype=torch.float32)
+        velocity_violation = float(torch.relu(torch.abs(joint_vel) - joint_vel_limits).mean().item())
     else:
-        foot_sliding = 0.0
+        velocity_violation = 0.0
 
-    root_width = min(6, qvel.shape[1])
-    root_violation = torch.relu(torch.abs(qvel[:, :root_width]) - config.max_root_qvel).mean() if root_width else qvel.new_tensor(0.0)
-    joint_violation = torch.relu(torch.abs(joint_vel) - config.max_joint_vel).mean() if joint_vel.numel() else qvel.new_tensor(0.0)
-    body_lin_violation = torch.relu(torch.linalg.vector_norm(body_lin, dim=-1) - config.max_body_lin_vel).mean()
-    body_ang_violation = torch.relu(torch.linalg.vector_norm(body_ang, dim=-1) - config.max_body_ang_vel).mean()
-    velocity_violation = float((root_violation + joint_violation + body_lin_violation + body_ang_violation).item())
-
-    if qvel.shape[0] >= 3:
-        qacc = torch.diff(qvel, dim=0) * float(fps)
-        jerk = float(torch.diff(qacc, dim=0).abs().mean().item())
+    if qvel.shape[0] >= 2:
+        prev_qvel = torch.cat([qvel[:1], qvel[:-1]], dim=0)
+        accel = (qvel - prev_qvel) * float(fps)
+        jerk = float((torch.linalg.vector_norm(accel, dim=1) * 0.01).mean().item())
     else:
         jerk = 0.0
 
-    dynamic_body_z = body_pos[:, 1:, 2] if body_pos.shape[1] > 1 else body_pos[:, :, 2]
-    min_body_z = dynamic_body_z.min(dim=1).values
-    floating_frames_ratio = float((min_body_z > config.floating_height).to(torch.float32).mean().item())
-    penetration = float(torch.relu(config.penetration_height - min_body_z).mean().item())
-
-    if pair_left.numel() > 0 and config.contact_sample_stride > 0:
-        sampled = body_pos[:: config.contact_sample_stride]
-        left_pos = sampled.index_select(1, pair_left.to(sampled.device))
-        right_pos = sampled.index_select(1, pair_right.to(sampled.device))
-        dists = torch.linalg.vector_norm(left_pos - right_pos, dim=-1)
-        self_collision = float((dists < config.self_collision_distance).to(torch.float32).mean().item())
-    else:
-        self_collision = 0.0
+    floor_min_dist = contact_summary["floor_min_dist"].to(device=body_pos.device, dtype=torch.float32)
+    non_floor_contact_count = contact_summary["non_floor_contact_count"].to(device=body_pos.device, dtype=torch.float32)
+    penetration = float(torch.relu(-floor_min_dist - float(config.penetration_margin)).mean().item())
+    floating_frames_ratio = _sustained_air_ratio(floor_min_dist, fps=fps, config=config)
+    self_collision = float(torch.clamp(non_floor_contact_count, max=float(config.self_collision_count_clip)).mean().item())
 
     penalties = {
         "foot_sliding": foot_sliding,
@@ -180,26 +216,16 @@ def _score_motion(
     }
 
 
-def _write_scores_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def _copy_pass_dataset(input_root: Path, pass_root: Path, rows: list[dict[str, Any]], *, pass_threshold: float) -> Path:
+def _copy_pass_dataset(input_root: Path, pass_root: Path, score_rows: list[dict[str, Any]], *, pass_threshold: float) -> Path:
     manifest = load_manifest(input_root)
-    selected = [row["motion"] for row in rows if row["status"] == "kept"]
+    selected_motions = [score_row["motion"] for score_row in score_rows if score_row["status"] == "kept"]
     if pass_root.exists():
         shutil.rmtree(pass_root)
     ensure_dir(pass_root)
     total_frames = 0
-    for rel in selected:
-        src = input_root / rel
-        dst = pass_root / rel
+    for rel_motion in selected_motions:
+        src = input_root / rel_motion
+        dst = pass_root / rel_motion
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         total_frames += int(load_motion(src).shape[0])
@@ -211,17 +237,21 @@ def _copy_pass_dataset(input_root: Path, pass_root: Path, rows: list[dict[str, A
         mjcf=manifest.payload["mjcf"],
         timestep=manifest.timestep,
         qpos_names=list(manifest.payload["qpos_names"]),
-        num_motions=len(selected),
+        num_motions=len(selected_motions),
         source=source,
         total_hours=float(total_frames * manifest.timestep / 3600.0),
     )
 
 
-def run_filter(args: argparse.Namespace) -> dict[str, Any]:
+def run_filter(args: PhysicalFilterArgs) -> dict[str, Any]:
     start_time = time.perf_counter()
-    input_root = resolve_dataset_root(args.input_root)
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    input_root = resolve_dataset_root(args.input_path)
+    project_root = (
+        resolve_project_root(args.project_path)
+        if args.project_path is not None
+        else default_project_root_for_input(input_root)
+    )
+    project_root.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(input_root)
     fps = 1.0 / manifest.timestep
     motion_paths = sorted((input_root / manifest.payload.get("motions_subdir", "motions")).rglob("*.npz"))
@@ -234,49 +264,88 @@ def run_filter(args: argparse.Namespace) -> dict[str, Any]:
         pass_threshold=float(args.pass_threshold),
         batch_frames=int(args.batch_frames),
         fk_batch_size=int(args.fk_batch_size),
-        contact_sample_stride=int(args.contact_sample_stride),
+        contact_nconmax=int(args.contact_nconmax),
     )
     weights = PhysicalScoreWeights()
-    runner = FKRunner(mjcf_path=manifest.mjcf_path, batch_size=config.fk_batch_size, device=args.device)
+    with temp_mjcf_with_floor(manifest.mjcf_path) as scoring_mjcf_path:
+        runner = FKRunner(
+            mjcf_path=scoring_mjcf_path,
+            batch_size=config.fk_batch_size,
+            device=args.device,
+            contact_nconmax=config.contact_nconmax,
+        )
+    if runner.model.nq != len(manifest.payload["qpos_names"]):
+        raise ValueError(
+            f"Floor-augmented scoring model nq={runner.model.nq} does not match manifest qpos width "
+            f"{len(manifest.payload['qpos_names'])}"
+        )
     if str(args.device).startswith("cuda") and runner.backend != "mujoco_warp":
         print(
             "[any4hdmi-limmt-score] MuJoCo Warp is unavailable; falling back to CPU MuJoCo. "
             "Install with `uv sync --extra warp` for the AMASS <15min target."
         )
-    foot_indices = torch.as_tensor(_body_indices(runner.body_names, ("foot", "ankle")), dtype=torch.long, device=runner.device)
-    pair_left, pair_right = _self_collision_pairs(runner.body_names, len(runner.body_names))
+    floor_geom_id, floor_geom_name = _resolve_floor_geom_id(runner.model)
+    left_foot_body_id = _body_id_by_name(runner.model, "left_ankle_roll_link")
+    right_foot_body_id = _body_id_by_name(runner.model, "right_ankle_roll_link")
+    missing_foot_bodies = [
+        name
+        for name, body_id in (
+            ("left_ankle_roll_link", left_foot_body_id),
+            ("right_ankle_roll_link", right_foot_body_id),
+        )
+        if body_id is None
+    ]
+    if missing_foot_bodies:
+        raise ValueError(
+            "G1 foot body ids are required for LIMMT scoring; missing body names: "
+            + ", ".join(missing_foot_bodies)
+        )
+    assert left_foot_body_id is not None and right_foot_body_id is not None
+    foot_body_ids = (left_foot_body_id, right_foot_body_id)
+    joint_vel_limits = _joint_velocity_limits(runner.joint_names, default=config.max_joint_vel, device=runner.device)
+    contact_buffer_saturation_count = 0
 
-    rows: list[dict[str, Any]] = []
+    score_rows: list[dict[str, Any]] = []
     reason_counts: Counter[str] = Counter()
-    batch_items: list[dict[str, Any]] = []
+    motion_batch: list[dict[str, Any]] = []
     batch_frames = 0
 
     def flush() -> None:
-        nonlocal batch_items, batch_frames
-        if not batch_items:
+        nonlocal motion_batch, batch_frames, contact_buffer_saturation_count
+        if not motion_batch:
             return
-        qpos_list = [item["qpos"] for item in batch_items]
-        qvel_list = [item["qvel"] for item in batch_items]
+        qpos_list = [motion_sample["qpos"] for motion_sample in motion_batch]
+        qvel_list = [motion_sample["qvel"] for motion_sample in motion_batch]
         lengths = [int(qpos.shape[0]) for qpos in qpos_list]
-        outputs = runner.forward_kinematics(torch.cat(qpos_list, dim=0), torch.cat(qvel_list, dim=0))
-        splits = {key: value.split(lengths, dim=0) for key, value in outputs.items()}
-        qvel_splits = torch.cat(qvel_list, dim=0).split(lengths, dim=0)
-        for idx, item in enumerate(batch_items):
-            row = _score_motion(
-                rel_motion=item["rel_motion"].as_posix(),
-                outputs={key: splits[key][idx] for key in splits},
-                qvel=qvel_splits[idx],
+        packed_qpos = torch.cat(qpos_list, dim=0)
+        packed_qvel = torch.cat(qvel_list, dim=0)
+        fk_results = runner.forward_kinematics(packed_qpos, packed_qvel)
+        contact_summary = runner.forward_contact_summary(
+            packed_qpos,
+            packed_qvel,
+            floor_geom_id=floor_geom_id,
+        )
+        contact_saturation = int(contact_summary["contact_buffer_saturated"].to(device="cpu").sum().item())
+        fk_result_splits = {key: value.split(lengths, dim=0) for key, value in fk_results.items()}
+        contact_summary_splits = {key: value.split(lengths, dim=0) for key, value in contact_summary.items()}
+        qvel_splits = packed_qvel.split(lengths, dim=0)
+        contact_buffer_saturation_count += contact_saturation
+        for motion_idx, motion_sample in enumerate(motion_batch):
+            score_row = _score_motion(
+                rel_motion=motion_sample["rel_motion"].as_posix(),
+                fk_results={key: fk_result_splits[key][motion_idx] for key in fk_result_splits},
+                qvel=qvel_splits[motion_idx],
                 fps=fps,
                 config=config,
                 weights=weights,
-                foot_indices=foot_indices,
-                pair_left=pair_left,
-                pair_right=pair_right,
+                contact_summary={key: contact_summary_splits[key][motion_idx] for key in contact_summary_splits},
+                joint_vel_limits=joint_vel_limits,
+                foot_body_ids=foot_body_ids,
             )
-            rows.append(row)
-            if row["status"] != "kept":
+            score_rows.append(score_row)
+            if score_row["status"] != "kept":
                 reason_counts.update(["physical_score_below_threshold"])
-        batch_items = []
+        motion_batch = []
         batch_frames = 0
 
     loader = build_motion_loader(
@@ -289,48 +358,53 @@ def run_filter(args: argparse.Namespace) -> dict[str, Any]:
         pin_memory=runner.device.type == "cuda",
         tensor_device=runner.device,
     )
-    for item in tqdm(loader, total=len(motion_paths), desc="LIMMT physical score", unit="motion"):
-        frames = int(item["qpos"].shape[0])
-        if batch_items and batch_frames + frames > config.batch_frames:
+    for motion_sample in tqdm(loader, total=len(motion_paths), desc="LIMMT physical score", unit="motion"):
+        frames = int(motion_sample["qpos"].shape[0])
+        if motion_batch and batch_frames + frames > config.batch_frames:
             flush()
-        batch_items.append(item)
+        motion_batch.append(motion_sample)
         batch_frames += frames
     flush()
 
-    rows.sort(key=lambda row: row["motion"])
-    kept = [row["motion"] for row in rows if row["status"] == "kept"]
-    scores_json = output_dir / "scores.json"
-    scores_csv = output_dir / "scores.csv"
-    pass_filenames = output_dir / "pass_filenames.txt"
+    score_rows.sort(key=lambda score_row: score_row["motion"])
+    kept_motions = [score_row["motion"] for score_row in score_rows if score_row["status"] == "kept"]
+    scores_json = project_root / "scores.json"
+    pass_filenames = project_root / "pass_filenames.txt"
     elapsed = time.perf_counter() - start_time
-    summary = {
+    filter_summary = {
         "input_root": str(input_root),
-        "output_dir": str(output_dir),
+        "project_root": str(project_root),
         "backend": runner.backend,
         "device": str(runner.device),
         "elapsed_seconds": elapsed,
         "elapsed_minutes": elapsed / 60.0,
-        "total_motions": len(rows),
-        "kept_motions": len(kept),
-        "rejected_motions": len(rows) - len(kept),
+        "total_motions": len(score_rows),
+        "kept_motions": len(kept_motions),
+        "rejected_motions": len(score_rows) - len(kept_motions),
         "reason_counts": dict(reason_counts),
         "config": config.__dict__,
         "weights": weights.__dict__,
+        "contact_based": True,
+        "floor_geom_id": floor_geom_id,
+        "floor_geom_name": floor_geom_name,
+        "contact_backend": runner.backend,
+        "nconmax": config.contact_nconmax,
+        "contact_buffer_saturation_count": contact_buffer_saturation_count,
+        "foot_body_ids": list(foot_body_ids),
     }
-    write_json(scores_json, {"summary": summary, "details": rows})
-    _write_scores_csv(scores_csv, rows)
-    pass_filenames.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-    pass_root = output_dir / args.pass_dataset_name
-    manifest_path = _copy_pass_dataset(input_root, pass_root, rows, pass_threshold=config.pass_threshold)
-    summary["pass_dataset_root"] = str(pass_root)
-    summary["pass_manifest"] = str(manifest_path)
-    write_json(output_dir / "summary.json", summary)
-    print(json.dumps(summary, indent=2))
-    return summary
+    write_json(scores_json, {"summary": filter_summary, "details": score_rows})
+    pass_filenames.write_text("\n".join(kept_motions) + ("\n" if kept_motions else ""), encoding="utf-8")
+    pass_root = project_pass_root(project_root, args.pass_dataset_name)
+    manifest_path = _copy_pass_dataset(input_root, pass_root, score_rows, pass_threshold=config.pass_threshold)
+    filter_summary["pass_dataset_root"] = str(pass_root)
+    filter_summary["pass_manifest"] = str(manifest_path)
+    write_json(project_root / "summary.json", filter_summary)
+    print(json.dumps(filter_summary, indent=2))
+    return filter_summary
 
 
 def main() -> None:
-    run_filter(_parse_args())
+    run_filter(tyro.cli(PhysicalFilterArgs))
 
 
 if __name__ == "__main__":
