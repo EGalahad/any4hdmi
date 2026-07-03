@@ -12,23 +12,17 @@ from typing import Any, Iterator
 import numpy as np
 from tqdm import tqdm
 
-try:
-    from mjhub import resolve_asset_reference
-except ImportError:
-    from mjhub import resolve_mjcf_reference as resolve_asset_reference
-
 from any4hdmi.core.format import MOTION_DTYPE, MOTIONS_SUBDIR, repo_root, save_motion, write_manifest
 from any4hdmi.core.model import base_qpos_adr, joint_qpos_adrs, load_model
 from any4hdmi.utils.mjcf import (
-    DEFAULT_MJCF_PATH,
-    DEFAULT_MJCF_REPO_ID,
-    DEFAULT_MJCF_REVISION,
-    build_hf_mjcf_reference,
     qpos_names_from_model,
+    resolve_mjcf_path,
 )
 
 
 DEFAULT_INPUT_PATH = Path.home() / "Downloads" / "100style.tar"
+DEFAULT_DATASET_NAME = "100style"
+DEFAULT_MJCF = "hf://elijahgalahad/g1_xmls@main/g1-mode_13_15.xml"
 DEFAULT_SOURCE_ROOT_NAME = "100STYLE"
 _TORCH_DTYPE_TO_NUMPY: dict[str, np.dtype[Any]] = {
     "torch.float16": np.float16,
@@ -77,6 +71,11 @@ def _parse_args() -> argparse.Namespace:
         help="Output dataset root for converted motions.",
     )
     parser.add_argument(
+        "--dataset-name",
+        default=DEFAULT_DATASET_NAME,
+        help="Dataset name written to manifest.json.",
+    )
+    parser.add_argument(
         "--source-root-name",
         default=DEFAULT_SOURCE_ROOT_NAME,
         help="Path component used to strip absolute source prefixes from id_label.json paths.",
@@ -88,25 +87,21 @@ def _parse_args() -> argparse.Namespace:
         help="Frame rate of the MotionDataset export. generate_dataset.py uses 50 fps by default.",
     )
     parser.add_argument(
-        "--mjcf-repo",
-        default=DEFAULT_MJCF_REPO_ID,
-        help="Hugging Face repo id that stores the MJCF and mesh assets.",
-    )
-    parser.add_argument(
-        "--mjcf-path",
-        default=DEFAULT_MJCF_PATH,
-        help="Path to the MJCF file within --mjcf-repo.",
-    )
-    parser.add_argument(
-        "--mjcf-revision",
-        default=DEFAULT_MJCF_REVISION,
-        help="Revision passed to Hugging Face snapshot_download.",
+        "--mjcf",
+        default=DEFAULT_MJCF,
+        help="Local MJCF/XML path or hf:// reference.",
     )
     return parser.parse_args()
 
 
 def _load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _resolve_mjcf_argument(mjcf: str) -> str | Path:
+    if mjcf.startswith("hf://"):
+        return mjcf
+    return Path(mjcf).expanduser().resolve()
 
 
 def _torch_dtype_to_numpy(name: str) -> np.dtype[Any]:
@@ -323,12 +318,8 @@ def main() -> None:
         out_dir = repo_root() / out_dir
     out_dir = out_dir.resolve()
 
-    mjcf_reference = build_hf_mjcf_reference(
-        repo_id=args.mjcf_repo,
-        path=args.mjcf_path,
-        revision=args.mjcf_revision,
-    )
-    mjcf_path = resolve_asset_reference(mjcf_reference)
+    mjcf_reference = _resolve_mjcf_argument(str(args.mjcf))
+    mjcf_path = resolve_mjcf_path(mjcf_reference)
     model = load_model(mjcf_path)
     qpos_names = qpos_names_from_model(model)
     base_adr = base_qpos_adr(model)
@@ -383,7 +374,7 @@ def main() -> None:
     }
     write_manifest(
         out_dir,
-        dataset_name="100style",
+        dataset_name=args.dataset_name,
         mjcf=mjcf_reference,
         timestep=1.0 / args.fps,
         qpos_names=qpos_names,

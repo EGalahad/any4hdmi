@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
 
 from any4hdmi.dataset.base import BaseDataset
 from any4hdmi.dataset.fk_cache import FKCache, FKCacheEntry
-from any4hdmi.dataset.loading import resolve_input_paths
+from any4hdmi.dataset.loading import (
+    resolve_any4hdmi_dataset_context,
+    resolve_input_paths,
+    resolve_motion_filenames,
+)
 from any4hdmi.dataset.full import FullMotionDataset
 from any4hdmi.dataset.windowed import OnlineQposDataset, WindowedMotionDataset
 
@@ -71,6 +76,8 @@ def load_any4hdmi_dataset(
     root_path: str | Path | list[str] | list[Path],
     target_fps: int,
     base_dir: Path,
+    filenames: Sequence[str] | None = None,
+    filenames_path: str | Path | None = None,
     body_names: list[str] | None = None,
     joint_names: list[str] | None = None,
     num_envs: int,
@@ -79,10 +86,19 @@ def load_any4hdmi_dataset(
     windowed_pin_window_load: bool = True,
 ) -> BaseDataset:
     input_paths = resolve_input_paths(base_dir, root_path)
+    filenames_root = base_dir
+    if filenames_path is not None and filenames is None:
+        filenames_root, _ = resolve_any4hdmi_dataset_context(input_paths)
+    motion_filenames = resolve_motion_filenames(
+        filenames_root,
+        filenames=filenames,
+        filenames_path=filenames_path,
+    )
     cache_entry = FKCache.from_inputs(
         input_paths=input_paths,
         target_fps=target_fps,
         base_dir=base_dir,
+        motion_filenames=motion_filenames,
     ).get_or_build()
     cache_entry = _prune_cache_entry(
         cache_entry,

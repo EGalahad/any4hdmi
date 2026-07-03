@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -89,6 +90,47 @@ def resolve_input_paths(base_dir: Path, root_path: str | list[str] | Path | list
     return resolved_paths
 
 
+def resolve_optional_path(root_dir: Path, path: str | Path | None) -> Path | None:
+    if path is None:
+        return None
+    expanded = Path(path).expanduser()
+    if not expanded.is_absolute():
+        expanded = root_dir / expanded
+    return expanded.resolve()
+
+
+def resolve_motion_filenames(
+    root_dir: Path,
+    *,
+    filenames: Sequence[str] | None = None,
+    filenames_path: str | Path | None = None,
+) -> list[str] | None:
+    if filenames is not None and filenames_path is not None:
+        raise ValueError("Pass only one of filenames or filenames_path")
+
+    if filenames_path is not None:
+        resolved_path = resolve_optional_path(root_dir, filenames_path)
+        if resolved_path is None:
+            raise RuntimeError("Failed to resolve filenames_path")
+        if not resolved_path.is_file():
+            raise FileNotFoundError(f"Motion filenames file not found: {resolved_path}")
+        loaded = [
+            line.strip()
+            for line in resolved_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    elif filenames is not None:
+        if isinstance(filenames, (str, bytes)):
+            raise TypeError("filenames must be a sequence of strings, not a string")
+        loaded = [str(filename).strip() for filename in filenames if str(filename).strip()]
+    else:
+        return None
+
+    if not loaded:
+        raise ValueError("Motion filenames view must contain at least one filename")
+    return loaded
+
+
 def find_any4hdmi_root(path: Path) -> Path | None:
     current = path if path.is_dir() else path.parent
     for candidate in (current, *current.parents):
@@ -127,9 +169,47 @@ def _collect_any4hdmi_motion_paths(
     dataset_root: Path,
     dataset_manifest: dict[str, Any],
     input_paths: list[Path],
+    motion_filenames: Sequence[str] | None = None,
 ) -> list[Path]:
     motion_paths: set[Path] = set()
-    motions_root = dataset_root / dataset_manifest.get("motions_subdir", "motions")
+    motions_subdir = str(dataset_manifest.get("motions_subdir", "motions"))
+    motions_root = dataset_root / motions_subdir
+
+    if motion_filenames is not None:
+        resolved_paths: list[Path] = []
+        seen: set[Path] = set()
+        motions_root_resolved = motions_root.resolve()
+        for raw_filename in motion_filenames:
+            rel_raw = str(raw_filename).strip()
+            if not rel_raw:
+                continue
+            rel_path = Path(rel_raw)
+            if rel_path.is_absolute():
+                raise ValueError(f"Motion filename entries must be relative paths, got {rel_raw!r}")
+            parts = rel_path.parts
+            if parts and parts[0] == motions_subdir:
+                rel_path = Path(*parts[1:])
+                parts = rel_path.parts
+            if not parts or any(part in {"", ".", ".."} for part in parts):
+                raise ValueError(f"Invalid motion filename entry: {rel_raw!r}")
+            if rel_path.suffix != ".npz":
+                raise ValueError(f"Motion filename entries must point to .npz files, got {rel_raw!r}")
+
+            motion_path = (motions_root_resolved / rel_path).resolve()
+            try:
+                motion_path.relative_to(motions_root_resolved)
+            except ValueError as exc:
+                raise ValueError(f"Motion filename escapes motions root: {rel_raw!r}") from exc
+            if not motion_path.is_file():
+                raise FileNotFoundError(f"Motion filename entry not found under {motions_root}: {rel_raw!r}")
+            if motion_path in seen:
+                raise ValueError(f"Duplicate motion filename entry: {rel_raw!r}")
+            seen.add(motion_path)
+            resolved_paths.append(motion_path.absolute())
+
+        if not resolved_paths:
+            raise RuntimeError(f"No qpos motions selected by filenames view under {dataset_root}")
+        return resolved_paths
 
     for input_path in input_paths:
         if input_path.is_file():
@@ -144,14 +224,10 @@ def _collect_any4hdmi_motion_paths(
             for path in tqdm(scan_root.rglob("*.npz"), desc=f"Scanning {scan_root.name}", unit="file")
         )
 
-    if not motion_paths:
-        motion_paths.update(
-            path.absolute()
-            for path in tqdm(motions_root.rglob("*.npz"), desc=f"Scanning {motions_root.name}", unit="file")
-        )
     motion_paths_list = sorted(motion_paths)
     if not motion_paths_list:
-        raise RuntimeError(f"No qpos motions found under {dataset_root}")
+        roots = ", ".join(str(path) for path in input_paths)
+        raise RuntimeError(f"No qpos motions found under requested any4hdmi input path(s): {roots}")
     return motion_paths_list
 
 
@@ -202,7 +278,11 @@ def _common_parent(paths: list[Path]) -> Path:
     return Path(os.path.commonpath([str(path.absolute()) for path in paths])).absolute()
 
 
-def resolve_dataset_context(input_paths: list[Path]) -> DatasetContext:
+def resolve_dataset_context(
+    input_paths: list[Path],
+    *,
+    motion_filenames: Sequence[str] | None = None,
+) -> DatasetContext:
     dataset_roots = [find_any4hdmi_root(path) for path in input_paths]
     if all(root is not None for root in dataset_roots):
         dataset_root, dataset_manifest = _resolve_any4hdmi_dataset_root(input_paths)
@@ -210,6 +290,7 @@ def resolve_dataset_context(input_paths: list[Path]) -> DatasetContext:
             dataset_root=dataset_root,
             dataset_manifest=dataset_manifest,
             input_paths=input_paths,
+            motion_filenames=motion_filenames,
         )
         return DatasetContext(
             dataset_kind="any4hdmi",
@@ -220,6 +301,9 @@ def resolve_dataset_context(input_paths: list[Path]) -> DatasetContext:
 
     if any(root is not None for root in dataset_roots):
         raise ValueError("Cannot mix any4hdmi dataset inputs with legacy motion.npz inputs")
+
+    if motion_filenames is not None:
+        raise ValueError("Motion filenames views are only supported for any4hdmi datasets")
 
     motion_paths = resolve_legacy_motion_paths(input_paths)
     return DatasetContext(
@@ -234,7 +318,11 @@ def resolve_any4hdmi_dataset_context(input_paths: list[Path]) -> tuple[Path, dic
     return _resolve_any4hdmi_dataset_root(input_paths)
 
 
-def resolve_any4hdmi_motion_paths(input_paths: list[Path]) -> tuple[Path, dict[str, Any], list[Path]]:
+def resolve_any4hdmi_motion_paths(
+    input_paths: list[Path],
+    *,
+    motion_filenames: Sequence[str] | None = None,
+) -> tuple[Path, dict[str, Any], list[Path]]:
     dataset_root, dataset_manifest = _resolve_any4hdmi_dataset_root(input_paths)
     return (
         dataset_root,
@@ -243,6 +331,7 @@ def resolve_any4hdmi_motion_paths(input_paths: list[Path]) -> tuple[Path, dict[s
             dataset_root=dataset_root,
             dataset_manifest=dataset_manifest,
             input_paths=input_paths,
+            motion_filenames=motion_filenames,
         ),
     )
 

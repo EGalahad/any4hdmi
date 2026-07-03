@@ -11,6 +11,7 @@ dependencies = [
     "huggingface_hub",
     "matplotlib",
     "mjhub @ git+https://github.com/EGalahad/mjhub.git@main",
+    "mjviser",
     "mujoco",
     "numpy",
     "pandas",
@@ -18,6 +19,7 @@ dependencies = [
     "tensordict",
     "torch",
     "tqdm",
+    "viser",
 ]
 
 [project.optional-dependencies]

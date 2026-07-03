@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -179,7 +180,9 @@ def _make_motion_cache_key(
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
-def _acquire_cache_lock(lock_dir: Path, ready_flag: Path, timeout_s: float = 600.0) -> bool:
+def _acquire_cache_lock(lock_dir: Path, ready_flag: Path, timeout_s: float | None = None) -> bool:
+    if timeout_s is None:
+        timeout_s = float(_env_int("ANY4HDMI_QPOS_CACHE_LOCK_TIMEOUT_S", 3600))
     start_time = time.monotonic()
     while True:
         if ready_flag.is_file():
@@ -714,8 +717,9 @@ class FKCache:
         input_paths: list[Path],
         target_fps: int,
         base_dir: Path,
+        motion_filenames: Sequence[str] | None = None,
     ) -> FKCache:
-        dataset_context = resolve_dataset_context(input_paths)
+        dataset_context = resolve_dataset_context(input_paths, motion_filenames=motion_filenames)
         mjcf_path: Path | None = None
         if dataset_context.dataset_kind == "any4hdmi":
             if dataset_context.manifest is None:
