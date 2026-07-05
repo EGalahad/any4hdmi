@@ -70,7 +70,9 @@ def _resolve_hf_dataset_path(root_path: str) -> Path:
             f"Dataset path {repo_path or '.'!r} was not found in Hugging Face dataset repo "
             f"{repo_id!r} at revision {revision!r}"
         )
-    return resolved_path.absolute()
+    resolved_path = resolved_path.absolute()
+    print(f"Resolved hf:// path: {resolved_path}", flush=True)
+    return resolved_path
 
 
 def resolve_input_paths(base_dir: Path, root_path: str | list[str] | Path | list[Path]) -> list[Path]:
