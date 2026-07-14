@@ -19,15 +19,12 @@
 当前对外导出的符号定义在 [src/any4hdmi/dataset/__init__.py](/home/elijah/Documents/projects/simple-tracking/any4hdmi/src/any4hdmi/dataset/__init__.py)：
 
 - `BaseDataset`
-- `DatasetIndex`
 - `MotionData`
 - `MotionSample`
 - `FullMotionDataset`
 - `WindowedMotionDataset`
-- `OnlineQposDataset`
+- `MotionDatasetRouter`
 - `load_any4hdmi_dataset`
-
-其中 `OnlineQposDataset` 目前只是 `WindowedMotionDataset` 的别名。
 
 ## Module Layout
 
@@ -39,8 +36,6 @@
 
 - `MotionData`
   一个 `TensorClass`，字段包括 `motion_id`、`step`、`body_pos_w`、`body_lin_vel_w`、`body_quat_w`、`body_ang_vel_w`、`joint_pos`、`joint_vel`
-- `DatasetIndex`
-  只保存平铺后的 `motion_id` / `step` 索引
 - `MotionSample`
   `sample_motion()` 的返回值，包含 `motion_id`、`motion_len`、`start_t`
 - `BaseDataset`
@@ -113,10 +108,15 @@ load_any4hdmi_dataset(
     root_path: str | Path | list[str] | list[Path],
     target_fps: int,
     base_dir: Path,
+    num_envs: int,
+    full_motion: bool,
+    shard: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    filenames: Sequence[str] | None = None,
+    filenames_path: str | Path | None = None,
     body_names: list[str] | None = None,
     joint_names: list[str] | None = None,
-    num_envs: int,
-    full_motion: bool = True,
     windowed_next_window_device: str | torch.device | None = "current",
     windowed_pin_window_load: bool = True,
 ) -> BaseDataset
@@ -124,10 +124,10 @@ load_any4hdmi_dataset(
 
 行为：
 
-- 先在内部通过 `resolve_input_paths(base_dir, root_path)` 规范化输入路径
-- 总是先通过 `FKCache.from_inputs(...).get_or_build()` 拿到 cache
-- `full_motion=True` 时返回 `FullMotionDataset`
-- `full_motion=False` 时返回 `WindowedMotionDataset`
+- `prepare_cache_entry(...)` 负责路径解析、字段 pruning 和 shared FP16 backing；不读取 `shard` 或 `full_motion`
+- `partition_cache_entry(...)` 只按显式 `shard/rank/world_size` 改变 motion 可见范围；`shard=False` 时直接返回原 entry
+- `build_runtime_dataset(...)` 只按 `full_motion` 构造 `FullMotionDataset` 或 `WindowedMotionDataset`
+- resident storage 和 windowed source storage 均为 FP16，读取结果为 FP32
 - `body_names` / `joint_names` 不为空时，只保留这些 motion cache fields
 
 注意：
@@ -158,6 +158,8 @@ load_any4hdmi_dataset(
 - 为每个 env 维护一份 `current` window 和一份 `next` window
 - `RUNTIME_MOTION_MAX_LEN = 512`
 - 用单线程 `ThreadPoolExecutor` 预取下一窗到 runtime pool
+- 后台线程通过独立 CUDA stream、pinned scratch 和 non-blocking H2D 直接写 persistent next pool
+- Future 完成即表示 next pool 对训练线程可读
 - `sample_motion()` 在 non-rewind 时等待并 promote `next -> current`，随后再次调度新的 `next`
 - `get_slice()` 只从当前 window pool gather
 
@@ -171,10 +173,12 @@ load_any4hdmi_dataset(
 
 当前 dataset runtime 流程可以概括为：
 
-1. `load_any4hdmi_dataset(...)` 在内部规范化 CLI / 上层传入路径
-2. `FKCache` 解析 dataset root、manifest、motion 列表并构建或命中磁盘 cache
-3. `load_any4hdmi_dataset(...)` 选择返回 `FullMotionDataset` 或 `WindowedMotionDataset`
+1. `prepare_cache_entry(...)` 解析输入并构建或命中 shared FP16 backing
+2. `partition_cache_entry(...)` 执行 identity 或 motion-aligned rank partition
+3. `build_runtime_dataset(...)` 构造 resident 或 optimized windowed runtime
 4. 上层通过 `sample_motion()` 和 `get_slice()` 读取 motion 数据
+
+多数据集场景由 `MotionDatasetRouter` 负责通用的 runtime ID routing 和 resident child FP16 packing；权重与训练采样策略由调用方负责。
 
 ## Related Docs
 

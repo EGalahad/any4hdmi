@@ -20,25 +20,6 @@ class MotionData(TensorClass):
 
 
 @dataclass
-class DatasetIndex:
-    motion_id: torch.Tensor
-    step: torch.Tensor
-
-    def __len__(self) -> int:
-        return int(self.motion_id.shape[0])
-
-    @property
-    def device(self) -> torch.device:
-        return self.motion_id.device
-
-    def to(self, device: torch.device | str) -> DatasetIndex:
-        return DatasetIndex(
-            motion_id=self.motion_id.to(device),
-            step=self.step.to(device),
-        )
-
-
-@dataclass
 class MotionSample:
     motion_id: torch.Tensor
     motion_len: torch.Tensor
@@ -66,7 +47,6 @@ class BaseDataset(ABC):
     starts: torch.Tensor
     ends: torch.Tensor
     lengths: torch.Tensor
-    data: DatasetIndex
     device: torch.device
 
     @property
@@ -74,8 +54,14 @@ class BaseDataset(ABC):
         return int(self.starts.shape[0])
 
     @property
+    @abstractmethod
     def num_steps(self) -> int:
-        return len(self.data)
+        raise NotImplementedError
+
+    @property
+    def sample_id_span(self) -> int:
+        """Number of IDs that sample_motion may return for this runtime."""
+        return self.num_motions
 
     @abstractmethod
     def to(self, device: torch.device | str) -> BaseDataset:
@@ -87,8 +73,6 @@ class BaseDataset(ABC):
         motion_ids: torch.Tensor,
         starts: torch.Tensor,
         steps: torch.Tensor,
-        *,
-        profile_name: str | None = None,
     ):
         raise NotImplementedError
 

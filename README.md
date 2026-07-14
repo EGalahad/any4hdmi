@@ -71,6 +71,8 @@ load_any4hdmi_dataset(
   target_fps=50,
   base_dir=Path.cwd(),
   num_envs=1,
+  full_motion=True,
+  shard=False,
 )
 ```
 

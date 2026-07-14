@@ -1,8 +1,8 @@
 # any4hdmi Notes
 
 - Windowed datasets default to staging the next 512-frame window on the current runtime GPU (`windowed_next_window_device: current`) and using pinned CPU scratch for background window loads (`windowed_pin_window_load: true`).
-- If a large run OOMs after enabling windowed datasets, first try moving the next window back to CPU with `windowed_next_window_device: cpu` or `ANY4HDMI_NEXT_WINDOW_DEVICE=cpu`. This saves the extra fp16 next-window GPU pool.
-- If pinned host memory allocation fails or causes system memory pressure, disable it with `windowed_pin_window_load: false` or `ANY4HDMI_PIN_WINDOW_LOAD=0`.
+- If a large run OOMs after enabling windowed datasets, first try moving the next window back to CPU with `windowed_next_window_device: cpu`. This saves the extra fp16 next-window GPU pool.
+- If pinned host memory allocation fails or causes system memory pressure, disable it with `windowed_pin_window_load: false`.
 - For HDMI-style tracking tasks, always prune unused motion fields before constructing full/windowed datasets. Keeping only task-used bodies plus required joints made GPU next-window staging feasible at 8192 envs on 24 GB GPUs; this should not be exposed as a normal config toggle.
 - Do not assume `full_motion: false` is automatically faster. With CPU next-window staging it was measurably slower; the fast path needs pruned fields, GPU next-window staging, and pinned window loads.
 - Keep `RUNTIME_MOTION_MAX_LEN` fixed at 512 unless there is a benchmark-backed reason to change it. Do not dynamically shorten sampled windows by motion length; clamp sampled starts instead.

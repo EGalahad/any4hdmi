@@ -8,6 +8,42 @@ from any4hdmi.dataset.base import BaseDataset, MotionData, MotionSample
 from any4hdmi.dataset.fk_cache import FKCacheEntry
 
 
+_FLOAT_FIELD_NAMES = (
+    "body_pos_w",
+    "body_lin_vel_w",
+    "body_quat_w",
+    "body_ang_vel_w",
+    "joint_pos",
+    "joint_vel",
+)
+_MOTION_DATA_FIELD_NAMES = ("motion_id", "step", *_FLOAT_FIELD_NAMES)
+
+
+def convert_motion_data(
+    data: MotionData,
+    *,
+    float_dtype: torch.dtype | None,
+    motion_id_offset: int = 0,
+) -> MotionData:
+    if float_dtype is None and motion_id_offset == 0:
+        return data
+    fields = {
+        name: (
+            getattr(data, name).to(dtype=float_dtype)
+            if float_dtype is not None and name in _FLOAT_FIELD_NAMES
+            else getattr(data, name)
+        )
+        for name in _MOTION_DATA_FIELD_NAMES
+    }
+    if motion_id_offset:
+        fields["motion_id"] = fields["motion_id"] - motion_id_offset
+    return MotionData(
+        **fields,
+        device=data.device,
+        batch_size=data.batch_size,
+    )
+
+
 class FullMotionDataset(BaseDataset):
     def __init__(
         self,
@@ -20,6 +56,8 @@ class FullMotionDataset(BaseDataset):
         data: MotionData,
         num_envs: int,
         device: torch.device | str | None = None,
+        output_float_dtype: torch.dtype | None = None,
+        motion_id_offset: int = 0,
     ) -> None:
         if num_envs <= 0:
             raise ValueError(f"num_envs must be positive, got {num_envs}")
@@ -32,8 +70,14 @@ class FullMotionDataset(BaseDataset):
         self.ends = torch.as_tensor(ends, device=self.device, dtype=torch.long)
         self.lengths = self.ends - self.starts
         self._num_envs = int(num_envs)
-        self._env_motion_id = torch.full((self._num_envs,), -1, device=self.device, dtype=torch.long)
-        self._env_motion_len = torch.zeros((self._num_envs,), device=self.device, dtype=torch.long)
+        self._output_float_dtype = output_float_dtype
+        self.motion_id_offset = int(motion_id_offset)
+        self._env_motion_id = torch.full(
+            (self._num_envs,), -1, device=self.device, dtype=torch.long
+        )
+        self._env_motion_len = torch.zeros(
+            (self._num_envs,), device=self.device, dtype=torch.long
+        )
         if device is not None:
             self.to(device)
 
@@ -44,6 +88,7 @@ class FullMotionDataset(BaseDataset):
         *,
         num_envs: int,
         device: torch.device | str | None = None,
+        output_float_dtype: torch.dtype | None = None,
     ) -> FullMotionDataset:
         return cls(
             body_names=entry.body_names,
@@ -54,7 +99,13 @@ class FullMotionDataset(BaseDataset):
             data=entry.as_motion_data(),
             num_envs=num_envs,
             device=device,
+            output_float_dtype=output_float_dtype,
+            motion_id_offset=entry.motion_id_offset,
         )
+
+    @property
+    def num_steps(self) -> int:
+        return len(self.data)
 
     def to(self, device: torch.device | str) -> FullMotionDataset:
         target_device = torch.device(device)
@@ -72,17 +123,18 @@ class FullMotionDataset(BaseDataset):
         motion_ids: torch.Tensor,
         starts: torch.Tensor,
         steps: torch.Tensor,
-        *,
-        profile_name: str | None = None,
     ) -> MotionData:
-        del profile_name
         motion_ids = motion_ids.to(device=self.device, dtype=torch.long)
         starts = starts.to(device=self.device, dtype=torch.long)
         steps = steps.to(device=self.device, dtype=torch.long)
         idx = (self.starts[motion_ids] + starts).unsqueeze(1) + steps.unsqueeze(0)
         idx.clamp_max_(self.ends[motion_ids].unsqueeze(1) - 1)
         idx.clamp_min_(self.starts[motion_ids].unsqueeze(1))
-        return self.data[idx]
+        return convert_motion_data(
+            self.data[idx],
+            float_dtype=self._output_float_dtype,
+            motion_id_offset=self.motion_id_offset,
+        )
 
     def sample_motion(
         self,
@@ -106,7 +158,9 @@ class FullMotionDataset(BaseDataset):
             size=(env_ids.numel(),),
             device=self.device,
         )
-        sampled_motion_ids = self.data.motion_id[sampled_frame_ids].long()
+        sampled_motion_ids = (
+            self.data.motion_id[sampled_frame_ids].long() - self.motion_id_offset
+        )
         sampled_start_t = self.data.step[sampled_frame_ids].long()
         sampled_motion_len = self.lengths[sampled_motion_ids].long()
 

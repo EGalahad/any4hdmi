@@ -80,6 +80,7 @@ class FKCacheEntry:
     starts: list[int]
     ends: list[int]
     storage_fields: dict[str, torch.Tensor]
+    motion_id_offset: int = 0
 
     def as_motion_data(self) -> MotionData:
         motion_id = self.storage_fields["motion_id"]
