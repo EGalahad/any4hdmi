@@ -6,6 +6,7 @@ from unittest import mock
 
 import torch
 
+from any4hdmi.dataset.distributed_shard import balanced_frame_boundaries
 from any4hdmi.dataset.fk_cache import FKCacheEntry
 from any4hdmi.dataset.full import FullMotionDataset
 from any4hdmi.dataset.loaders import partition_cache_entry
@@ -44,6 +45,22 @@ def _entry() -> FKCacheEntry:
 
 
 class PartitionCacheEntryTest(unittest.TestCase):
+    def test_boundaries_balance_frames_without_splitting_motions(self) -> None:
+        lengths = [8, 1, 1, 1, 1, 1, 1, 1]
+        ends = torch.tensor(lengths).cumsum(0).tolist()
+
+        boundaries = balanced_frame_boundaries(ends, world_size=2)
+
+        self.assertEqual(boundaries, [0, 1, 8])
+        frame_boundaries = [0, *(ends[index - 1] for index in boundaries[1:])]
+        self.assertEqual(
+            [
+                right - left
+                for left, right in zip(frame_boundaries, frame_boundaries[1:])
+            ],
+            [8, 7],
+        )
+
     def test_identity_does_not_construct_or_copy(self) -> None:
         entry = _entry()
         with mock.patch(
