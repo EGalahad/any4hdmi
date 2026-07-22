@@ -9,8 +9,6 @@ from pathlib import Path
 import time
 from typing import Any, Iterable, Sequence
 
-import numpy as np
-
 from any4hdmi.core.format import load_manifest, load_motion
 from any4hdmi.limmt.common import project_pass_root, resolve_project_root, write_json
 
@@ -237,6 +235,8 @@ def run_score_browser(
 
     server = viser.ViserServer(host=host, port=port, label="any4hdmi-limmt-score-browser")
     scene = ViserMujocoScene(server, model, num_envs=1)
+    scene.camera_tracking_enabled = True
+    scene.create_scene_gui()
 
     state: dict[str, Any] = {
         "qpos": None,

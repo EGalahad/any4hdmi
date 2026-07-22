@@ -73,6 +73,8 @@ def _run_mjviser(
 
     server = viser.ViserServer(port=port, label="any4hdmi-view")
     scene = ViserMujocoScene(server, model, num_envs=1)
+    scene.camera_tracking_enabled = True
+    scene.create_scene_gui()
 
     state = {
         "playing": True,

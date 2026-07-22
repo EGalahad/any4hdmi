@@ -181,6 +181,8 @@ def _run_interactive_viewer(
     data = mujoco.MjData(model)
     server = viser.ViserServer(host=args.host, port=args.port, label="any4hdmi-limmt-visualize")
     scene = ViserMujocoScene(server, model, num_envs=1)
+    scene.camera_tracking_enabled = True
+    scene.create_scene_gui()
 
     score_by_name = _load_score_map(project_root / "scores.json")
     state = {
