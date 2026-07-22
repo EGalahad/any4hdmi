@@ -23,7 +23,9 @@ def lerp(ts_target, ts_source, x):
     )
 
 
-def _lerp_torch(ts_target: torch.Tensor, ts_source: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+def _lerp_torch(
+    ts_target: torch.Tensor, ts_source: torch.Tensor, x: torch.Tensor
+) -> torch.Tensor:
     right_idx = torch.searchsorted(ts_source, ts_target, right=False)
     right_idx = right_idx.clamp(1, ts_source.numel() - 1)
     left_idx = right_idx - 1
@@ -54,13 +56,17 @@ def _resample_times_torch(
     if length <= 0:
         raise ValueError(f"Expected positive sequence length, got {length}")
     if source_fps <= 0 or target_fps <= 0:
-        raise ValueError(f"fps must be positive, got source_fps={source_fps}, target_fps={target_fps}")
+        raise ValueError(
+            f"fps must be positive, got source_fps={source_fps}, target_fps={target_fps}"
+        )
 
     source_times = torch.arange(length, device=device, dtype=dtype) / float(source_fps)
     if length == 1:
         return source_times, source_times.clone()
 
-    target_times = torch.arange(target_length, device=device, dtype=dtype) / float(target_fps)
+    target_times = torch.arange(target_length, device=device, dtype=dtype) / float(
+        target_fps
+    )
     return source_times, target_times
 
 
@@ -73,7 +79,9 @@ def resampled_length(
     if length <= 0:
         raise ValueError(f"Expected positive sequence length, got {length}")
     if source_fps <= 0 or target_fps <= 0:
-        raise ValueError(f"fps must be positive, got source_fps={source_fps}, target_fps={target_fps}")
+        raise ValueError(
+            f"fps must be positive, got source_fps={source_fps}, target_fps={target_fps}"
+        )
     if length == 1 or source_fps == target_fps:
         return int(length)
     duration = (length - 1) / float(source_fps)
@@ -188,7 +196,9 @@ def slerp(ts_target, ts_source, quat):
     return out.reshape(steps_target, *batch_shape, quat_dim)
 
 
-def _slerp_torch(ts_target: torch.Tensor, ts_source: torch.Tensor, quat: torch.Tensor) -> torch.Tensor:
+def _slerp_torch(
+    ts_target: torch.Tensor, ts_source: torch.Tensor, quat: torch.Tensor
+) -> torch.Tensor:
     batch_shape = quat.shape[1:-1]
     quat_dim = quat.shape[-1]
     if quat_dim != 4:
@@ -227,7 +237,9 @@ def _slerp_torch(ts_target: torch.Tensor, ts_source: torch.Tensor, quat: torch.T
     sin_theta_0 = torch.sin(theta_0)
     theta = theta_0 * alpha
 
-    safe_denom = torch.where(sin_theta_0 > 1e-8, sin_theta_0, torch.ones_like(sin_theta_0))
+    safe_denom = torch.where(
+        sin_theta_0 > 1e-8, sin_theta_0, torch.ones_like(sin_theta_0)
+    )
     s0 = torch.sin(theta_0 - theta) / safe_denom
     s1 = torch.sin(theta) / safe_denom
     slerp_out = s0 * q0 + s1 * q1
@@ -274,14 +286,20 @@ def _packed_interp_plan_torch(
     output_indices = torch.arange(total_output, device=device, dtype=torch.long)
     local_output_idx = output_indices - output_starts.index_select(0, clip_ids)
 
-    source_pos = local_output_idx.to(dtype=dtype) * (float(source_fps) / float(target_fps))
+    source_pos = local_output_idx.to(dtype=dtype) * (
+        float(source_fps) / float(target_fps)
+    )
     single_frame_mask = clip_lengths_t.index_select(0, clip_ids) <= 1
     max_right = (clip_lengths_t.index_select(0, clip_ids) - 1).clamp_min(0)
 
     right_local = torch.ceil(source_pos).to(dtype=torch.long)
-    right_local = torch.where(single_frame_mask, torch.zeros_like(right_local), right_local.clamp_min(1))
+    right_local = torch.where(
+        single_frame_mask, torch.zeros_like(right_local), right_local.clamp_min(1)
+    )
     right_local = torch.minimum(right_local, max_right)
-    left_local = torch.where(single_frame_mask, torch.zeros_like(right_local), right_local - 1)
+    left_local = torch.where(
+        single_frame_mask, torch.zeros_like(right_local), right_local - 1
+    )
 
     alpha = torch.where(
         single_frame_mask,
@@ -320,7 +338,9 @@ def _packed_slerp_by_indices_torch(
     sin_theta_0 = torch.sin(theta_0)
     theta = theta_0 * alpha_quat
 
-    safe_denom = torch.where(sin_theta_0 > 1e-8, sin_theta_0, torch.ones_like(sin_theta_0))
+    safe_denom = torch.where(
+        sin_theta_0 > 1e-8, sin_theta_0, torch.ones_like(sin_theta_0)
+    )
     s0 = torch.sin(theta_0 - theta) / safe_denom
     s1 = torch.sin(theta) / safe_denom
     slerp_out = s0 * q0 + s1 * q1
@@ -392,10 +412,33 @@ def interpolate_qpos_qvel_batch_torch(
     source_fps: float,
     target_fps: float,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    if len(qpos_list) != len(qvel_list):
-        raise ValueError(f"Expected qpos/qvel list lengths to match, got {len(qpos_list)} and {len(qvel_list)}")
-    if not qpos_list:
+    if not qpos_list and not qvel_list:
         return [], []
+    packed_qpos, packed_qvel, output_lengths = interpolate_qpos_qvel_packed_torch(
+        qpos_list,
+        qvel_list,
+        source_fps=source_fps,
+        target_fps=target_fps,
+    )
+    return (
+        list(packed_qpos.split(output_lengths, dim=0)),
+        list(packed_qvel.split(output_lengths, dim=0)),
+    )
+
+
+def interpolate_qpos_qvel_packed_torch(
+    qpos_list: list[torch.Tensor],
+    qvel_list: list[torch.Tensor],
+    *,
+    source_fps: float,
+    target_fps: float,
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    if len(qpos_list) != len(qvel_list):
+        raise ValueError(
+            f"Expected qpos/qvel list lengths to match, got {len(qpos_list)} and {len(qvel_list)}"
+        )
+    if not qpos_list:
+        raise ValueError("Expected at least one qpos/qvel clip")
 
     prepared_qpos: list[torch.Tensor] = []
     prepared_qvel: list[torch.Tensor] = []
@@ -404,11 +447,17 @@ def interpolate_qpos_qvel_batch_torch(
 
     for qpos, qvel in zip(qpos_list, qvel_list, strict=True):
         if qpos.ndim != 2:
-            raise ValueError(f"Expected qpos to be rank 2, got shape {tuple(qpos.shape)}")
+            raise ValueError(
+                f"Expected qpos to be rank 2, got shape {tuple(qpos.shape)}"
+            )
         if qvel.ndim != 2:
-            raise ValueError(f"Expected qvel to be rank 2, got shape {tuple(qvel.shape)}")
+            raise ValueError(
+                f"Expected qvel to be rank 2, got shape {tuple(qvel.shape)}"
+            )
         if qpos.device != device or qvel.device != device:
-            raise ValueError("Expected all qpos/qvel tensors in a batch to share the same device")
+            raise ValueError(
+                "Expected all qpos/qvel tensors in a batch to share the same device"
+            )
         if qpos.shape[0] != qvel.shape[0]:
             raise ValueError(
                 f"Expected qpos/qvel frame counts to match, got {tuple(qpos.shape)} and {tuple(qvel.shape)}"
@@ -418,7 +467,11 @@ def interpolate_qpos_qvel_batch_torch(
         clip_lengths.append(int(qpos.shape[0]))
 
     if source_fps == target_fps or all(length <= 1 for length in clip_lengths):
-        return prepared_qpos, prepared_qvel
+        return (
+            torch.cat(prepared_qpos, dim=0),
+            torch.cat(prepared_qvel, dim=0),
+            clip_lengths,
+        )
 
     packed_qpos = torch.cat(prepared_qpos, dim=0)
     packed_qvel = torch.cat(prepared_qvel, dim=0)
@@ -454,10 +507,7 @@ def interpolate_qpos_qvel_batch_torch(
         packed_qpos_interp = _packed_lerp(packed_qpos)
 
     packed_qvel_interp = _packed_lerp(packed_qvel)
-    return (
-        list(packed_qpos_interp.split(output_lengths, dim=0)),
-        list(packed_qvel_interp.split(output_lengths, dim=0)),
-    )
+    return packed_qpos_interp, packed_qvel_interp, output_lengths
 
 
 def interpolate_packed_torch(
@@ -469,10 +519,7 @@ def interpolate_packed_torch(
 ) -> tuple[dict[str, torch.Tensor], list[int]]:
     if not clip_lengths:
         return (
-            {
-                key: value[:0]
-                for key, value in motion.items()
-            },
+            {key: value[:0] for key, value in motion.items()},
             [],
         )
 
@@ -489,10 +536,16 @@ def interpolate_packed_torch(
     ]
     extra_keys = set(motion.keys()) - set(in_keys)
     if extra_keys:
-        raise NotImplementedError(f"interpolation is not fully implemented for keys: {extra_keys}")
+        raise NotImplementedError(
+            f"interpolation is not fully implemented for keys: {extra_keys}"
+        )
 
-    clip_lengths_t = torch.as_tensor(clip_lengths, device=motion["joint_pos"].device, dtype=torch.long)
-    output_lengths_t = ((clip_lengths_t - 1).clamp_min(0) * int(target_fps)) // int(source_fps) + 1
+    clip_lengths_t = torch.as_tensor(
+        clip_lengths, device=motion["joint_pos"].device, dtype=torch.long
+    )
+    output_lengths_t = ((clip_lengths_t - 1).clamp_min(0) * int(target_fps)) // int(
+        source_fps
+    ) + 1
     total_output = int(output_lengths_t.sum().item())
 
     input_starts = torch.cumsum(
@@ -508,7 +561,9 @@ def interpolate_packed_torch(
         torch.arange(len(clip_lengths), device=clip_lengths_t.device, dtype=torch.long),
         output_lengths_t,
     )
-    output_indices = torch.arange(total_output, device=clip_lengths_t.device, dtype=torch.long)
+    output_indices = torch.arange(
+        total_output, device=clip_lengths_t.device, dtype=torch.long
+    )
     local_output_idx = output_indices - output_starts.index_select(0, clip_ids)
 
     single_frame_mask = clip_lengths_t.index_select(0, clip_ids) <= 1
@@ -522,8 +577,12 @@ def interpolate_packed_torch(
     max_right = (clip_lengths_t.index_select(0, clip_ids) - 1).clamp_min(0)
     right_local = right_local.clamp_min(1)
     right_local = torch.minimum(right_local, max_right)
-    right_local = torch.where(single_frame_mask, torch.zeros_like(right_local), right_local)
-    left_local = torch.where(single_frame_mask, torch.zeros_like(right_local), right_local - 1)
+    right_local = torch.where(
+        single_frame_mask, torch.zeros_like(right_local), right_local
+    )
+    left_local = torch.where(
+        single_frame_mask, torch.zeros_like(right_local), right_local - 1
+    )
 
     t_left = left_local.to(dtype=motion["joint_pos"].dtype) * float(target_fps)
     t_right = right_local.to(dtype=motion["joint_pos"].dtype) * float(target_fps)
@@ -564,7 +623,9 @@ def interpolate_packed_torch(
         sin_theta_0 = torch.sin(theta_0)
         theta = theta_0 * alpha_quat
 
-        safe_denom = torch.where(sin_theta_0 > 1e-8, sin_theta_0, torch.ones_like(sin_theta_0))
+        safe_denom = torch.where(
+            sin_theta_0 > 1e-8, sin_theta_0, torch.ones_like(sin_theta_0)
+        )
         s0 = torch.sin(theta_0 - theta) / safe_denom
         s1 = torch.sin(theta) / safe_denom
         slerp_out = s0 * q0 + s1 * q1
@@ -599,14 +660,20 @@ def interpolate(motion: dict[str, Any], source_fps: int, target_fps: int):
     ]
     extra_keys = set(motion.keys()) - set(in_keys)
     if extra_keys:
-        raise NotImplementedError(f"interpolation is not fully implemented for keys: {extra_keys}")
+        raise NotImplementedError(
+            f"interpolation is not fully implemented for keys: {extra_keys}"
+        )
 
     length = motion["joint_pos"].shape[0]
     if isinstance(motion["joint_pos"], torch.Tensor):
         device = motion["joint_pos"].device
         dtype = motion["joint_pos"].dtype
-        ts_source = torch.arange(0, (length - 1) * target_fps + 1, target_fps, device=device, dtype=dtype)
-        ts_target = torch.arange(0, (length - 1) * target_fps + 1, source_fps, device=device, dtype=dtype)
+        ts_source = torch.arange(
+            0, (length - 1) * target_fps + 1, target_fps, device=device, dtype=dtype
+        )
+        ts_target = torch.arange(
+            0, (length - 1) * target_fps + 1, source_fps, device=device, dtype=dtype
+        )
         motion["body_pos_w"] = _lerp_torch(
             ts_target,
             ts_source,
@@ -617,7 +684,9 @@ def interpolate(motion: dict[str, Any], source_fps: int, target_fps: int):
             ts_source,
             motion["body_lin_vel_w"].reshape(length, -1),
         ).reshape(len(ts_target), -1, 3)
-        motion["body_quat_w"] = _slerp_torch(ts_target, ts_source, motion["body_quat_w"])
+        motion["body_quat_w"] = _slerp_torch(
+            ts_target, ts_source, motion["body_quat_w"]
+        )
         motion["body_ang_vel_w"] = _lerp_torch(
             ts_target,
             ts_source,
@@ -629,9 +698,9 @@ def interpolate(motion: dict[str, Any], source_fps: int, target_fps: int):
 
     ts_source = np.arange(0, (length - 1) * target_fps + 1, target_fps)
     ts_target = np.arange(0, (length - 1) * target_fps + 1, source_fps)
-    motion["body_pos_w"] = lerp(ts_target, ts_source, motion["body_pos_w"].reshape(length, -1)).reshape(
-        len(ts_target), -1, 3
-    )
+    motion["body_pos_w"] = lerp(
+        ts_target, ts_source, motion["body_pos_w"].reshape(length, -1)
+    ).reshape(len(ts_target), -1, 3)
     motion["body_lin_vel_w"] = lerp(
         ts_target,
         ts_source,

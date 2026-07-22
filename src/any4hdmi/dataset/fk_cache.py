@@ -7,7 +7,7 @@ import os
 import shutil
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,7 +22,7 @@ from any4hdmi.dataset.base import MotionData
 from any4hdmi.dataset.interpolation import (
     MOTION_DATA_FIELDS,
     interpolate_motion_data,
-    interpolate_qpos_qvel_batch_torch,
+    interpolate_qpos_qvel_packed_torch,
     resampled_length,
 )
 from any4hdmi.dataset.loading import (
@@ -110,7 +110,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _cache_root(base_dir: Path) -> Path:
-    cache_root = base_dir / QPOS_CACHE_SUBDIR
+    cache_root_override = os.environ.get("ANY4HDMI_QPOS_CACHE_ROOT")
+    if cache_root_override:
+        cache_root = Path(cache_root_override).expanduser()
+    else:
+        cache_root = base_dir / QPOS_CACHE_SUBDIR
+    cache_root = cache_root.resolve()
     cache_root.mkdir(parents=True, exist_ok=True)
     return cache_root
 
@@ -168,20 +173,25 @@ def _make_motion_cache_key(
     if dataset_context.dataset_kind == "any4hdmi":
         if mjcf_path is None:
             raise ValueError("mjcf_path is required for any4hdmi dataset cache keys")
-        payload["manifest"] = _stat_fingerprint(dataset_context.dataset_root / "manifest.json")
+        payload["manifest"] = _stat_fingerprint(
+            dataset_context.dataset_root / "manifest.json"
+        )
         payload["mjcf"] = _content_fingerprint(mjcf_path)
         payload["motions"] = [
             _fingerprint_motion_entry(path) for path in dataset_context.motion_paths
         ]
     else:
         payload["motions"] = [
-            _fingerprint_legacy_motion_entry(path) for path in dataset_context.motion_paths
+            _fingerprint_legacy_motion_entry(path)
+            for path in dataset_context.motion_paths
         ]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
-def _acquire_cache_lock(lock_dir: Path, ready_flag: Path, timeout_s: float | None = None) -> bool:
+def _acquire_cache_lock(
+    lock_dir: Path, ready_flag: Path, timeout_s: float | None = None
+) -> bool:
     if timeout_s is None:
         timeout_s = float(_env_int("ANY4HDMI_QPOS_CACHE_LOCK_TIMEOUT_S", 3600))
     start_time = time.monotonic()
@@ -211,7 +221,9 @@ def _resolve_any4hdmi_mjcf_path(dataset_root: Path, manifest: dict[str, Any]) ->
                     dataset_root=dataset_root,
                 )
             if "path" in mjcf_ref:
-                return resolve_mjcf_path(str(mjcf_ref["path"]), dataset_root=dataset_root)
+                return resolve_mjcf_path(
+                    str(mjcf_ref["path"]), dataset_root=dataset_root
+                )
             raise TypeError(f"Unsupported structured mjcf payload: {mjcf_ref!r}")
         return resolve_mjcf_path(mjcf_ref, dataset_root=dataset_root)
 
@@ -252,7 +264,9 @@ class _GrowableMotionStorage:
     ) -> None:
         self.root = cache_entry_dir / QPOS_CACHE_TD_SUBDIR
         self.root.mkdir(parents=True, exist_ok=True)
-        self.specs = _storage_field_specs(body_count=body_count, joint_count=joint_count)
+        self.specs = _storage_field_specs(
+            body_count=body_count, joint_count=joint_count
+        )
         self.capacity = max(1, int(initial_capacity))
         self.fields = self._open_fields(self.capacity)
 
@@ -319,6 +333,10 @@ def _cache_build_prefetch_factor() -> int:
         return DEFAULT_MOTION_LOADER_PREFETCH_FACTOR
 
 
+def _cache_build_loader_batch_size() -> int:
+    return _env_int("ANY4HDMI_CACHE_BUILD_LOADER_BATCH_SIZE", 32)
+
+
 def _cache_build_multiprocessing_context(num_workers: int) -> str | None:
     if int(num_workers) <= 0:
         return None
@@ -373,7 +391,7 @@ def _concat_motion_data_chunks(chunks: list[MotionData]) -> MotionData:
 def _motion_data_from_arrays(
     *,
     motion_idx: int,
-    motion: dict[str, np.ndarray | torch.Tensor],
+    motion: Mapping[str, np.ndarray | torch.Tensor],
 ) -> MotionData:
     motion_length = int(motion["joint_pos"].shape[0])
     motion_id = torch.full((motion_length,), motion_idx, dtype=torch.long)
@@ -442,6 +460,12 @@ def _build_fk_cache(
     cache_entry_dir: Path,
     target_fps: int,
 ) -> None:
+    build_started = time.perf_counter()
+    loader_wait_s = 0.0
+    interpolation_s = 0.0
+    fk_s = 0.0
+    output_to_cpu_s = 0.0
+    storage_write_s = 0.0
     model = load_model(mjcf_path)
     body_names = body_names_from_model(model)
     joint_names, _, _ = hinge_joint_info(model)
@@ -465,6 +489,8 @@ def _build_fk_cache(
         num_workers=num_workers,
         prefetch_factor=_cache_build_prefetch_factor(),
         pin_memory=fk_runner.device.type == "cuda",
+        batch_size=_cache_build_loader_batch_size(),
+        prevalidated_paths=True,
         multiprocessing_context=_cache_build_multiprocessing_context(num_workers),
         tensor_device=fk_runner.device,
     )
@@ -482,27 +508,34 @@ def _build_fk_cache(
     write_buffer_bytes = _cache_build_write_buffer_bytes()
 
     def flush_batched_motions() -> tuple[MotionData, list[int]] | None:
-        nonlocal batched_frames
+        nonlocal batched_frames, fk_s, interpolation_s, output_to_cpu_s
         if not batched_qpos:
             return None
 
-        qpos_batch, qvel_batch = interpolate_qpos_qvel_batch_torch(
+        interpolation_started = time.perf_counter()
+        packed_qpos, packed_qvel, lengths = interpolate_qpos_qvel_packed_torch(
             batched_qpos,
             batched_qvel,
             source_fps=float(source_fps),
             target_fps=float(target_fps),
         )
-        lengths = [int(qpos.shape[0]) for qpos in qpos_batch]
-        packed_qpos = torch.cat(qpos_batch, dim=0)
-        packed_qvel = torch.cat(qvel_batch, dim=0)
+        interpolation_s += time.perf_counter() - interpolation_started
         fk_start_time = time.perf_counter()
         packed_outputs = fk_runner.forward_kinematics(packed_qpos, packed_qvel)
         fk_elapsed_s = time.perf_counter() - fk_start_time
-        print(f"FK: {fk_elapsed_s:.2f}s for {len(batched_motion_ids)} motions / {int(packed_qpos.shape[0])} frames")
+        fk_s += fk_elapsed_s
+        print(
+            f"FK: {fk_elapsed_s:.2f}s for {len(batched_motion_ids)} motions / {int(packed_qpos.shape[0])} frames"
+        )
         device = packed_qpos.device
         length_t = torch.as_tensor(lengths, device=device, dtype=torch.long)
-        motion_ids_t = torch.as_tensor(batched_motion_ids, device=device, dtype=torch.long)
-        local_steps = [torch.arange(length, device=device, dtype=torch.long) for length in lengths]
+        motion_ids_t = torch.as_tensor(
+            batched_motion_ids, device=device, dtype=torch.long
+        )
+        local_steps = [
+            torch.arange(length, device=device, dtype=torch.long) for length in lengths
+        ]
+        output_to_cpu_started = time.perf_counter()
         motion_id = torch.repeat_interleave(motion_ids_t, length_t).to(device="cpu")
         motion_chunk = MotionData(
             motion_id=motion_id,
@@ -516,6 +549,7 @@ def _build_fk_cache(
             device=motion_id.device,
             batch_size=list(motion_id.shape),
         )
+        output_to_cpu_s += time.perf_counter() - output_to_cpu_started
 
         batched_motion_ids.clear()
         batched_qpos.clear()
@@ -524,7 +558,8 @@ def _build_fk_cache(
         return motion_chunk, lengths
 
     def flush_staged_motion_chunks() -> None:
-        nonlocal start_idx, staged_motion_bytes
+        nonlocal start_idx, staged_motion_bytes, storage_write_s
+        storage_started = time.perf_counter()
         start_idx = _write_motion_chunks_to_storage(
             storage=storage,
             staged_motion_chunks=staged_motion_chunks,
@@ -533,36 +568,61 @@ def _build_fk_cache(
             ends=ends,
             start_idx=start_idx,
         )
+        storage_write_s += time.perf_counter() - storage_started
         staged_motion_bytes = 0
 
-    motion_iter = iter(motion_loader)
-    for motion_idx, item in enumerate(tqdm(motion_iter, total=len(motion_paths), desc="Building FK cache", unit="file")):
-        qpos = item["qpos"]
-        qvel = item["qvel"]
-        motion_length = resampled_length(
-            int(qpos.shape[0]),
-            source_fps=float(source_fps),
-            target_fps=float(target_fps),
-        )
+    motion_idx = 0
+    with tqdm(
+        total=len(motion_paths), desc="Building FK cache", unit="file"
+    ) as progress:
+        motion_iter = iter(motion_loader)
+        while True:
+            loader_wait_started = time.perf_counter()
+            try:
+                item = next(motion_iter)
+            except StopIteration:
+                break
+            loader_wait_s += time.perf_counter() - loader_wait_started
+            qpos_packed = item["qpos"]
+            qvel_packed = item["qvel"]
+            raw_lengths = item.get("lengths")
+            if raw_lengths is None:
+                source_lengths = [int(qpos_packed.shape[0])]
+            else:
+                source_lengths = [int(length) for length in raw_lengths]
+            qpos_chunks = qpos_packed.split(source_lengths, dim=0)
+            qvel_chunks = qvel_packed.split(source_lengths, dim=0)
 
-        if batched_frames > 0 and batched_frames + motion_length >= fk_runner.batch_size:
-            flushed = flush_batched_motions()
-            if flushed is not None:
-                motion_chunk, lengths = flushed
-                staged_motion_bytes += _motion_data_num_bytes(motion_chunk)
-                staged_motion_chunks.append(motion_chunk)
-                staged_motion_lengths.extend(lengths)
-                if staged_motion_bytes >= write_buffer_bytes:
-                    print(
-                        f"Staged motion data size {staged_motion_bytes} bytes exceeds buffer limit "
-                        f"{write_buffer_bytes} bytes, flushing to storage"
-                    )
-                    flush_staged_motion_chunks()
+            for qpos, qvel in zip(qpos_chunks, qvel_chunks, strict=True):
+                motion_length = resampled_length(
+                    int(qpos.shape[0]),
+                    source_fps=float(source_fps),
+                    target_fps=float(target_fps),
+                )
 
-        batched_motion_ids.append(motion_idx)
-        batched_qpos.append(qpos)
-        batched_qvel.append(qvel)
-        batched_frames += motion_length
+                if (
+                    batched_frames > 0
+                    and batched_frames + motion_length >= fk_runner.batch_size
+                ):
+                    flushed = flush_batched_motions()
+                    if flushed is not None:
+                        motion_chunk, lengths = flushed
+                        staged_motion_bytes += _motion_data_num_bytes(motion_chunk)
+                        staged_motion_chunks.append(motion_chunk)
+                        staged_motion_lengths.extend(lengths)
+                        if staged_motion_bytes >= write_buffer_bytes:
+                            print(
+                                f"Staged motion data size {staged_motion_bytes} bytes exceeds buffer limit "
+                                f"{write_buffer_bytes} bytes, flushing to storage"
+                            )
+                            flush_staged_motion_chunks()
+
+                batched_motion_ids.append(motion_idx)
+                batched_qpos.append(qpos)
+                batched_qvel.append(qvel)
+                batched_frames += motion_length
+                motion_idx += 1
+            progress.update(len(source_lengths))
 
     flushed = flush_batched_motions()
     if flushed is not None:
@@ -571,6 +631,22 @@ def _build_fk_cache(
         staged_motion_chunks.append(motion_chunk)
         staged_motion_lengths.extend(lengths)
     flush_staged_motion_chunks()
+
+    profile = {
+        "files": len(motion_paths),
+        "frames": int(start_idx),
+        "loader_wait_s": loader_wait_s,
+        "interpolation_s": interpolation_s,
+        "fk_s": fk_s,
+        "output_to_cpu_s": output_to_cpu_s,
+        "storage_write_s": storage_write_s,
+        "total_s": time.perf_counter() - build_started,
+        "loader_batch_size": _cache_build_loader_batch_size(),
+        "fk_batch_size": fk_runner.batch_size,
+        "num_workers": num_workers,
+        "write_buffer_bytes": write_buffer_bytes,
+    }
+    print("FK_CACHE_BUILD_PROFILE " + json.dumps(profile, sort_keys=True), flush=True)
 
     index_payload = {
         "body_names": body_names,
@@ -584,7 +660,9 @@ def _build_fk_cache(
         "allocated_capacity": int(storage.capacity),
         "num_motions": len(starts),
     }
-    (cache_entry_dir / QPOS_CACHE_INDEX_NAME).write_text(json.dumps(index_payload, indent=2), encoding="utf-8")
+    (cache_entry_dir / QPOS_CACHE_INDEX_NAME).write_text(
+        json.dumps(index_payload, indent=2), encoding="utf-8"
+    )
     cache_meta = {
         "cache_version": QPOS_CACHE_VERSION,
         "dataset_root": str(dataset_root),
@@ -592,7 +670,9 @@ def _build_fk_cache(
         "mjcf_path": str(mjcf_path),
         "target_fps": int(target_fps),
     }
-    (cache_entry_dir / QPOS_CACHE_META_NAME).write_text(json.dumps(cache_meta, indent=2), encoding="utf-8")
+    (cache_entry_dir / QPOS_CACHE_META_NAME).write_text(
+        json.dumps(cache_meta, indent=2), encoding="utf-8"
+    )
     (cache_entry_dir / QPOS_CACHE_READY_NAME).write_text("ready\n", encoding="utf-8")
 
 
@@ -622,7 +702,12 @@ def _build_legacy_cache(
     write_buffer_bytes = _cache_build_write_buffer_bytes()
 
     for motion_idx, motion_path in enumerate(
-        tqdm(motion_paths, total=len(motion_paths), desc="Building legacy cache", unit="file")
+        tqdm(
+            motion_paths,
+            total=len(motion_paths),
+            desc="Building legacy cache",
+            unit="file",
+        )
     ):
         with np.load(motion_path, allow_pickle=True) as payload:
             motion = {
@@ -675,14 +760,18 @@ def _build_legacy_cache(
         "allocated_capacity": int(storage.capacity),
         "num_motions": len(starts),
     }
-    (cache_entry_dir / QPOS_CACHE_INDEX_NAME).write_text(json.dumps(index_payload, indent=2), encoding="utf-8")
+    (cache_entry_dir / QPOS_CACHE_INDEX_NAME).write_text(
+        json.dumps(index_payload, indent=2), encoding="utf-8"
+    )
     cache_meta = {
         "cache_version": QPOS_CACHE_VERSION,
         "dataset_kind": "legacy",
         "dataset_root": str(dataset_root),
         "target_fps": int(target_fps),
     }
-    (cache_entry_dir / QPOS_CACHE_META_NAME).write_text(json.dumps(cache_meta, indent=2), encoding="utf-8")
+    (cache_entry_dir / QPOS_CACHE_META_NAME).write_text(
+        json.dumps(cache_meta, indent=2), encoding="utf-8"
+    )
     (cache_entry_dir / QPOS_CACHE_READY_NAME).write_text("ready\n", encoding="utf-8")
 
 
@@ -720,7 +809,9 @@ class FKCache:
         base_dir: Path,
         motion_filenames: Sequence[str] | None = None,
     ) -> FKCache:
-        dataset_context = resolve_dataset_context(input_paths, motion_filenames=motion_filenames)
+        dataset_context = resolve_dataset_context(
+            input_paths, motion_filenames=motion_filenames
+        )
         mjcf_path: Path | None = None
         if dataset_context.dataset_kind == "any4hdmi":
             if dataset_context.manifest is None:
@@ -749,14 +840,19 @@ class FKCache:
         if not self.ready_flag.is_file():
             owns_lock = _acquire_cache_lock(self.lock_dir, self.ready_flag)
             if owns_lock:
-                tmp_entry_dir = self.cache_root / f"{self.cache_key}.tmp-{os.getpid()}-{time.time_ns()}"
+                tmp_entry_dir = (
+                    self.cache_root
+                    / f"{self.cache_key}.tmp-{os.getpid()}-{time.time_ns()}"
+                )
                 try:
                     if tmp_entry_dir.exists():
                         shutil.rmtree(tmp_entry_dir)
                     tmp_entry_dir.mkdir(parents=True, exist_ok=False)
                     if self.dataset_kind == "any4hdmi":
                         if self.manifest is None or self.mjcf_path is None:
-                            raise RuntimeError("any4hdmi cache build requires manifest and mjcf_path")
+                            raise RuntimeError(
+                                "any4hdmi cache build requires manifest and mjcf_path"
+                            )
                         _build_fk_cache(
                             dataset_root=self.dataset_root,
                             manifest=self.manifest,
@@ -767,7 +863,9 @@ class FKCache:
                         )
                     else:
                         if self.legacy_meta is None:
-                            raise RuntimeError("legacy cache build requires legacy_meta")
+                            raise RuntimeError(
+                                "legacy cache build requires legacy_meta"
+                            )
                         _build_legacy_cache(
                             dataset_root=self.dataset_root,
                             legacy_meta=self.legacy_meta,
@@ -786,7 +884,9 @@ class FKCache:
                     if self.lock_dir.exists():
                         shutil.rmtree(self.lock_dir, ignore_errors=True)
             elif not self.ready_flag.is_file():
-                raise RuntimeError(f"Cache lock released but cache is not ready: {self.cache_entry_dir}")
+                raise RuntimeError(
+                    f"Cache lock released but cache is not ready: {self.cache_entry_dir}"
+                )
 
         if built_cache:
             _release_cache_build_cuda_memory()
@@ -794,7 +894,9 @@ class FKCache:
         return self.load()
 
     def load(self, motion_paths: list[Path] | None = None) -> FKCacheEntry:
-        index_payload = json.loads((self.cache_entry_dir / QPOS_CACHE_INDEX_NAME).read_text(encoding="utf-8"))
+        index_payload = json.loads(
+            (self.cache_entry_dir / QPOS_CACHE_INDEX_NAME).read_text(encoding="utf-8")
+        )
         total_length = int(index_payload["total_length"])
         allocated_capacity = int(index_payload.get("allocated_capacity", total_length))
         body_count = len(index_payload["body_names"])
@@ -802,15 +904,20 @@ class FKCache:
         specs = _storage_field_specs(body_count=body_count, joint_count=joint_count)
         storage_fields: dict[str, torch.Tensor] = {}
         for field_name, (dtype, tail_shape) in specs.items():
-            storage_fields[field_name] = MemoryMappedTensor.from_filename(
-                str(self.cache_entry_dir / QPOS_CACHE_TD_SUBDIR / f"{field_name}.memmap"),
+            memory_mapped: Any = MemoryMappedTensor.from_filename(
+                str(
+                    self.cache_entry_dir / QPOS_CACHE_TD_SUBDIR / f"{field_name}.memmap"
+                ),
                 dtype=dtype,
                 shape=(allocated_capacity, *tail_shape),
-            )[:total_length]
+            )
+            storage_fields[field_name] = memory_mapped[:total_length]
 
         resolved_motion_paths = motion_paths
         if resolved_motion_paths is None:
-            resolved_motion_paths = [Path(path) for path in index_payload["motion_paths"]]
+            resolved_motion_paths = [
+                Path(path) for path in index_payload["motion_paths"]
+            ]
         return FKCacheEntry(
             cache_entry_dir=self.cache_entry_dir,
             body_names=list(index_payload["body_names"]),
