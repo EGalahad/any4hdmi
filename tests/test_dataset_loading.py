@@ -259,6 +259,66 @@ class DatasetLoadingTest(unittest.TestCase):
                     [dataset_root], motion_filenames=["../a.npz"]
                 )
 
+    def test_filenames_accept_hf_snapshot_blob_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_cache = Path(temp_dir) / "datasets--org--motions"
+            snapshot_root = repo_cache / "snapshots" / "revision"
+            motion_path = snapshot_root / "motions" / "a.npz"
+            blob_path = repo_cache / "blobs" / "motion-blob"
+            blob_path.parent.mkdir(parents=True)
+            with blob_path.open("wb") as blob_file:
+                np.savez_compressed(
+                    blob_file, qpos=np.zeros((2, 3), dtype=np.float32)
+                )
+            motion_path.parent.mkdir(parents=True)
+            motion_path.symlink_to("../../../blobs/motion-blob")
+            (snapshot_root / "manifest.json").write_text(
+                json.dumps({"motions_subdir": "motions"}) + "\n"
+            )
+
+            context = resolve_dataset_context(
+                [snapshot_root], motion_filenames=["a.npz"]
+            )
+
+            self.assertEqual(context.motion_paths, [motion_path.absolute()])
+            self.assertTrue(context.motion_paths[0].is_symlink())
+
+    def test_filenames_reject_non_hf_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            dataset_root = temp / "dataset"
+            motion_path = dataset_root / "motions" / "a.npz"
+            outside_path = temp / "outside.npz"
+            _write_motion(outside_path)
+            motion_path.parent.mkdir(parents=True)
+            motion_path.symlink_to(outside_path)
+            (dataset_root / "manifest.json").write_text(
+                json.dumps({"motions_subdir": "motions"}) + "\n"
+            )
+
+            with self.assertRaisesRegex(ValueError, "escapes motions root"):
+                resolve_dataset_context(
+                    [dataset_root], motion_filenames=["a.npz"]
+                )
+
+    def test_filenames_reject_parent_directory_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            dataset_root = temp / "dataset"
+            outside_dir = temp / "outside"
+            _write_motion(outside_dir / "a.npz")
+            motions_root = dataset_root / "motions"
+            motions_root.mkdir(parents=True)
+            (motions_root / "linked").symlink_to(outside_dir, target_is_directory=True)
+            (dataset_root / "manifest.json").write_text(
+                json.dumps({"motions_subdir": "motions"}) + "\n"
+            )
+
+            with self.assertRaisesRegex(ValueError, "escapes motions root"):
+                resolve_dataset_context(
+                    [dataset_root], motion_filenames=["linked/a.npz"]
+                )
+
     def test_filenames_path_missing_entry_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)

@@ -180,7 +180,25 @@ def _collect_any4hdmi_motion_paths(
     if motion_filenames is not None:
         resolved_paths: list[Path] = []
         seen: set[Path] = set()
+        resolved_parent_dirs: dict[Path, Path] = {}
+        motions_root_absolute = motions_root.absolute()
         motions_root_resolved = motions_root.resolve()
+        dataset_root_absolute = dataset_root.absolute()
+        snapshots_root = next(
+            (
+                parent
+                for parent in (dataset_root_absolute, *dataset_root_absolute.parents)
+                if parent.name == "snapshots"
+            ),
+            None,
+        )
+        hf_blobs_root = None
+        if snapshots_root is not None:
+            repo_cache_root = snapshots_root.parent
+            blobs_root = repo_cache_root / "blobs"
+            if repo_cache_root.name.startswith("datasets--") and blobs_root.is_dir():
+                hf_blobs_root = blobs_root.resolve()
+
         for raw_filename in motion_filenames:
             rel_raw = str(raw_filename).strip()
             if not rel_raw:
@@ -197,11 +215,30 @@ def _collect_any4hdmi_motion_paths(
             if rel_path.suffix != ".npz":
                 raise ValueError(f"Motion filename entries must point to .npz files, got {rel_raw!r}")
 
-            motion_path = (motions_root_resolved / rel_path).resolve()
-            try:
-                motion_path.relative_to(motions_root_resolved)
-            except ValueError as exc:
-                raise ValueError(f"Motion filename escapes motions root: {rel_raw!r}") from exc
+            motion_path = motions_root_absolute / rel_path
+            if not motion_path.is_relative_to(motions_root_absolute):
+                raise ValueError(f"Motion filename escapes motions root: {rel_raw!r}")
+            motion_parent = motion_path.parent
+            resolved_parent = resolved_parent_dirs.get(motion_parent)
+            if resolved_parent is None:
+                resolved_parent = motion_parent.resolve()
+                resolved_parent_dirs[motion_parent] = resolved_parent
+            is_symlink = motion_path.is_symlink()
+            resolved_motion_path = (
+                motion_path.resolve()
+                if is_symlink
+                else resolved_parent / motion_path.name
+            )
+            is_hf_blob_symlink = (
+                hf_blobs_root is not None
+                and is_symlink
+                and resolved_motion_path.is_relative_to(hf_blobs_root)
+            )
+            if (
+                not resolved_motion_path.is_relative_to(motions_root_resolved)
+                and not is_hf_blob_symlink
+            ):
+                raise ValueError(f"Motion filename escapes motions root: {rel_raw!r}")
             if not motion_path.is_file():
                 raise FileNotFoundError(f"Motion filename entry not found under {motions_root}: {rel_raw!r}")
             if motion_path in seen:
