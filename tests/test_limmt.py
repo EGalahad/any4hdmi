@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -401,6 +402,101 @@ class LimmtHmeTest(unittest.TestCase):
 
 
 class LimmtPhysicalFilterTest(unittest.TestCase):
+    def test_run_filter_writes_filenames_view_without_copying_dataset(self) -> None:
+        class FakeRunner:
+            backend = "test"
+
+            def __init__(self, mjcf_path, *, batch_size, device, contact_nconmax) -> None:
+                del batch_size, device, contact_nconmax
+                self.model = mujoco.MjModel.from_xml_path(str(mjcf_path))
+                self.device = torch.device("cpu")
+                self.joint_names: list[str] = []
+
+            def forward_kinematics(self, qpos: torch.Tensor, qvel: torch.Tensor) -> dict[str, torch.Tensor]:
+                del qvel
+                frames = qpos.shape[0]
+                return {
+                    "body_pos_w": torch.zeros((frames, self.model.nbody, 3)),
+                    "body_lin_vel_w": torch.zeros((frames, self.model.nbody, 3)),
+                    "body_ang_vel_w": torch.zeros((frames, self.model.nbody, 3)),
+                    "joint_vel": torch.zeros((frames, 0)),
+                }
+
+            def forward_contact_summary(
+                self,
+                qpos: torch.Tensor,
+                qvel: torch.Tensor,
+                *,
+                floor_geom_id: int,
+            ) -> dict[str, torch.Tensor]:
+                del qvel, floor_geom_id
+                floor_min_dist = torch.zeros(qpos.shape[0])
+                floor_min_dist[qpos.shape[0] // 2 :] = -1.0
+                return {
+                    "floor_min_dist": floor_min_dist,
+                    "non_floor_contact_count": torch.zeros(qpos.shape[0]),
+                    "contact_buffer_saturated": torch.zeros(qpos.shape[0], dtype=torch.bool),
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            dataset_root = temp / "dataset"
+            model_path = dataset_root / "model.xml"
+            model_path.parent.mkdir(parents=True)
+            model_path.write_text(
+                """
+                <mujoco>
+                  <asset>
+                    <material name="test" rgba="1 1 1 1"/>
+                  </asset>
+                  <worldbody>
+                    <body name="base">
+                      <freejoint name="root"/>
+                      <body name="left_ankle_roll_link"><geom type="sphere" size="0.01"/></body>
+                      <body name="right_ankle_roll_link"><geom type="sphere" size="0.01"/></body>
+                    </body>
+                  </worldbody>
+                </mujoco>
+                """,
+                encoding="utf-8",
+            )
+            qpos = np.zeros((2, 7), dtype=np.float32)
+            qpos[:, 3] = 1.0
+            save_motion(dataset_root / "motions" / "a.npz", qpos)
+            save_motion(dataset_root / "motions" / "b.npz", qpos)
+            write_manifest(
+                dataset_root,
+                dataset_name="input",
+                mjcf=model_path,
+                timestep=0.02,
+                qpos_names=["root_tx", "root_ty", "root_tz", "root_qw", "root_qx", "root_qy", "root_qz"],
+                num_motions=2,
+                source={"kind": "test"},
+                total_hours=4 * 0.02 / 3600.0,
+            )
+            motion_samples = [
+                {"qpos": torch.from_numpy(qpos), "qvel": torch.zeros((2, 6)), "rel_motion": Path("motions/a.npz")},
+                {"qpos": torch.from_numpy(qpos), "qvel": torch.zeros((2, 6)), "rel_motion": Path("motions/b.npz")},
+            ]
+            project_root = temp / "filter"
+            with (
+                patch.object(physical_filter, "FKRunner", FakeRunner),
+                patch.object(physical_filter, "build_motion_loader", return_value=motion_samples),
+            ):
+                summary = physical_filter.run_filter(
+                    physical_filter.PhysicalFilterArgs(
+                        input_path=str(dataset_root),
+                        project_path=str(project_root),
+                        device="cpu",
+                        num_workers=0,
+                    )
+                )
+
+            self.assertEqual((project_root / "filenames.txt").read_text(), "a.npz\n")
+            self.assertEqual(summary["filenames_path"], str(project_root / "filenames.txt"))
+            self.assertFalse((project_root / "passed").exists())
+            self.assertNotIn("pass_dataset_root", summary)
+
     def test_fk_runner_cpu_contact_summary_reports_floor_distances(self) -> None:
         xml = """
         <mujoco>

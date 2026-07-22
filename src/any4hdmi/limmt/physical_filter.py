@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -16,11 +15,10 @@ import tyro
 from mjhub import temp_mjcf_with_floor
 from tqdm import tqdm
 
-from any4hdmi.core.format import ensure_dir, load_manifest, load_motion, write_manifest
+from any4hdmi.core.format import load_manifest
 from any4hdmi.fk.runner import FKRunner
 from any4hdmi.limmt.common import (
     default_project_root_for_input,
-    project_pass_root,
     resolve_dataset_root,
     resolve_project_root,
     write_json,
@@ -60,7 +58,7 @@ class PhysicalFilterArgs:
 
     input_path: str
     project_path: str | None = None
-    pass_dataset_name: str = "passed"
+    scoring_mjcf_path: str | None = None
     pass_threshold: float = 90.0
     batch_frames: int = 131072
     fk_batch_size: int = 8192
@@ -68,6 +66,7 @@ class PhysicalFilterArgs:
     num_workers: int = max(1, min(16, (os.cpu_count() or 2) - 1))
     prefetch_factor: int = 4
     contact_nconmax: int = 128
+    start: int = 0
     limit: int | None = None
 
 
@@ -216,33 +215,6 @@ def _score_motion(
     }
 
 
-def _copy_pass_dataset(input_root: Path, pass_root: Path, score_rows: list[dict[str, Any]], *, pass_threshold: float) -> Path:
-    manifest = load_manifest(input_root)
-    selected_motions = [score_row["motion"] for score_row in score_rows if score_row["status"] == "kept"]
-    if pass_root.exists():
-        shutil.rmtree(pass_root)
-    ensure_dir(pass_root)
-    total_frames = 0
-    for rel_motion in selected_motions:
-        src = input_root / rel_motion
-        dst = pass_root / rel_motion
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        total_frames += int(load_motion(src).shape[0])
-    source = dict(manifest.payload.get("source", {}))
-    source["limmt_physical_filter"] = {"pass_threshold": float(pass_threshold), "input_root": str(input_root)}
-    return write_manifest(
-        pass_root,
-        dataset_name=pass_root.name,
-        mjcf=manifest.payload["mjcf"],
-        timestep=manifest.timestep,
-        qpos_names=list(manifest.payload["qpos_names"]),
-        num_motions=len(selected_motions),
-        source=source,
-        total_hours=float(total_frames * manifest.timestep / 3600.0),
-    )
-
-
 def run_filter(args: PhysicalFilterArgs) -> dict[str, Any]:
     start_time = time.perf_counter()
     input_root = resolve_dataset_root(args.input_path)
@@ -253,8 +225,18 @@ def run_filter(args: PhysicalFilterArgs) -> dict[str, Any]:
     )
     project_root.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(input_root)
+    scoring_mjcf_path = (
+        manifest.mjcf_path
+        if args.scoring_mjcf_path is None
+        else Path(args.scoring_mjcf_path).expanduser().resolve()
+    )
+    if not scoring_mjcf_path.is_file():
+        raise FileNotFoundError(f"Scoring MJCF not found: {scoring_mjcf_path}")
     fps = 1.0 / manifest.timestep
     motion_paths = sorted((input_root / manifest.payload.get("motions_subdir", "motions")).rglob("*.npz"))
+    if args.start < 0:
+        raise ValueError(f"start must be non-negative, got {args.start}")
+    motion_paths = motion_paths[int(args.start) :]
     if args.limit is not None:
         motion_paths = motion_paths[: int(args.limit)]
     if not motion_paths:
@@ -267,9 +249,9 @@ def run_filter(args: PhysicalFilterArgs) -> dict[str, Any]:
         contact_nconmax=int(args.contact_nconmax),
     )
     weights = PhysicalScoreWeights()
-    with temp_mjcf_with_floor(manifest.mjcf_path) as scoring_mjcf_path:
+    with temp_mjcf_with_floor(scoring_mjcf_path) as scoring_mjcf_with_floor_path:
         runner = FKRunner(
-            mjcf_path=scoring_mjcf_path,
+            mjcf_path=scoring_mjcf_with_floor_path,
             batch_size=config.fk_batch_size,
             device=args.device,
             contact_nconmax=config.contact_nconmax,
@@ -351,7 +333,7 @@ def run_filter(args: PhysicalFilterArgs) -> dict[str, Any]:
     loader = build_motion_loader(
         input_root=input_root,
         motion_paths=motion_paths,
-        mjcf_path=manifest.mjcf_path,
+        mjcf_path=scoring_mjcf_path,
         fps=fps,
         num_workers=int(args.num_workers),
         prefetch_factor=int(args.prefetch_factor),
@@ -367,13 +349,22 @@ def run_filter(args: PhysicalFilterArgs) -> dict[str, Any]:
     flush()
 
     score_rows.sort(key=lambda score_row: score_row["motion"])
-    kept_motions = [score_row["motion"] for score_row in score_rows if score_row["status"] == "kept"]
+    motions_subdir = Path(manifest.payload.get("motions_subdir", "motions"))
+    kept_motions = [
+        Path(score_row["motion"]).relative_to(motions_subdir).as_posix()
+        for score_row in score_rows
+        if score_row["status"] == "kept"
+    ]
     scores_json = project_root / "scores.json"
-    pass_filenames = project_root / "pass_filenames.txt"
+    filenames_path = project_root / "filenames.txt"
     elapsed = time.perf_counter() - start_time
     filter_summary = {
         "input_root": str(input_root),
         "project_root": str(project_root),
+        "filenames_path": str(filenames_path),
+        "scoring_mjcf_path": str(scoring_mjcf_path),
+        "input_start": int(args.start),
+        "input_limit": None if args.limit is None else int(args.limit),
         "backend": runner.backend,
         "device": str(runner.device),
         "elapsed_seconds": elapsed,
@@ -393,11 +384,7 @@ def run_filter(args: PhysicalFilterArgs) -> dict[str, Any]:
         "foot_body_ids": list(foot_body_ids),
     }
     write_json(scores_json, {"summary": filter_summary, "details": score_rows})
-    pass_filenames.write_text("\n".join(kept_motions) + ("\n" if kept_motions else ""), encoding="utf-8")
-    pass_root = project_pass_root(project_root, args.pass_dataset_name)
-    manifest_path = _copy_pass_dataset(input_root, pass_root, score_rows, pass_threshold=config.pass_threshold)
-    filter_summary["pass_dataset_root"] = str(pass_root)
-    filter_summary["pass_manifest"] = str(manifest_path)
+    filenames_path.write_text("\n".join(kept_motions) + ("\n" if kept_motions else ""), encoding="utf-8")
     write_json(project_root / "summary.json", filter_summary)
     print(json.dumps(filter_summary, indent=2))
     return filter_summary
