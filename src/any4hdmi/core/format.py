@@ -10,7 +10,6 @@ import numpy as np
 
 from any4hdmi.utils.mjcf import MjcfInput, normalize_mjcf_reference, resolve_mjcf_path
 
-
 FORMAT_VERSION = 2
 MANIFEST_NAME = "manifest.json"
 MOTIONS_SUBDIR = "motions"
@@ -104,7 +103,7 @@ def load_manifest(dataset_root: str | Path) -> DatasetManifest:
 
 
 def find_dataset_root(path: str | Path) -> Path:
-    path = Path(path).expanduser().resolve()
+    path = Path(path).expanduser().absolute()
     current = path if path.is_dir() else path.parent
     for candidate in [current, *current.parents]:
         if (candidate / MANIFEST_NAME).is_file():

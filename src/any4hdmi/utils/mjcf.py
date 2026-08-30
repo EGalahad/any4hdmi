@@ -39,12 +39,12 @@ def normalize_mjcf_reference(
     dataset_root: str | Path | None = None,
 ) -> MjcfInput:
     if isinstance(mjcf, Path):
-        return mjcf.expanduser().resolve()
+        return mjcf.expanduser().absolute()
     if isinstance(mjcf, str):
         if mjcf.startswith("hf://"):
             return mjcf
-        base_dir = Path(dataset_root).expanduser().resolve() if dataset_root else Path.cwd()
-        return (base_dir / mjcf).resolve()
+        base_dir = Path(dataset_root).expanduser().absolute() if dataset_root else Path.cwd()
+        return (base_dir / mjcf).absolute()
     raise TypeError(f"Unsupported mjcf payload type: {type(mjcf)!r}")
 
 
