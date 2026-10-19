@@ -242,8 +242,11 @@ class FKRunner:
 
         self._wp.copy(self._warp_data.qpos, self._wp.from_torch(qpos_work))
         self._wp.copy(self._warp_data.qvel, self._wp.from_torch(qvel_work))
-        self._mjw.fwd_position(self._warp_model, self._warp_data)
-        self._mjw.fwd_velocity(self._warp_model, self._warp_data)
+        # Reference FK needs poses and spatial velocities, not contact/constraint
+        # solves. Packed manipulation poses can exceed collision scratch capacity.
+        self._mjw.kinematics(self._warp_model, self._warp_data)
+        self._mjw.com_pos(self._warp_model, self._warp_data)
+        self._mjw.com_vel(self._warp_model, self._warp_data)
         if synchronize and hasattr(self._wp, "synchronize"):
             self._wp.synchronize()
 
